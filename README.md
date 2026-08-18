@@ -96,3 +96,6 @@ docker run -d --name stranger-club -p 8000:8000 \
 ```
 
 The volume preserves the database and uploads through container restarts. `/health` reports process health and `/ready` verifies database accessibility.
+
+By Guna 
+
