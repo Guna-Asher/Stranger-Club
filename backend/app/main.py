@@ -18,6 +18,7 @@ from .otp.base import OtpProvider
 from .otp.console import ConsoleOtpProvider
 from .routers import admin, auth, events, payments, player_auth, registrations
 from .services import api_error, backfill_missing_event_ownership, seed_database
+from .storage import LocalFilesystemStorage
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("stranger_club")
@@ -54,7 +55,10 @@ def create_app(data_dir: Path | None = None, frontend_dir: Path | None = None, a
         yield
 
     app = FastAPI(title="Stranger Club API", version="2.0.0", lifespan=lifespan)
-    app.state.session_factory = session_factory; app.state.uploads_dir = uploads_dir; app.state.broadcaster = EventBroadcaster(); app.state.login_attempts: dict[str, list[float]] = {}
+    app.state.session_factory = session_factory; app.state.uploads_dir = uploads_dir
+    app.state.proof_storage = LocalFilesystemStorage(uploads_dir / "proofs")
+    app.state.qr_storage = LocalFilesystemStorage(uploads_dir / "qr")
+    app.state.broadcaster = EventBroadcaster(); app.state.login_attempts: dict[str, list[float]] = {}
     app.state.registration_attempts: dict[str, list[float]] = {}; app.state.payment_upload_attempts: dict[str, list[float]] = {}
     app.state.otp_provider = otp_provider or ConsoleOtpProvider()
     app.state.otp_request_ip_attempts: dict[str, list[float]] = {}; app.state.otp_request_phone_attempts: dict[str, list[float]] = {}

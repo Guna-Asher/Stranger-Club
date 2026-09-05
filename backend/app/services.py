@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 import uuid
 from datetime import date, datetime, time
+from io import BytesIO
 from pathlib import Path
 
 from fastapi import HTTPException, UploadFile
@@ -11,21 +14,43 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
-from .models import AuditLog, Match, Organizer, Payment, Registration, User, now_ist
-from .schemas import EventUpdate, MatchCreate, RegistrationCreate
+from .models import (
+    AuditLog, EventPaymentConfiguration, Match, Organizer, Payment, PaymentProof, Registration, User, now_ist,
+)
+from .schemas import EventUpdate, MatchCreate, PaymentConfigurationUpdate, RegistrationCreate
+from .storage import Storage
 
 logger = logging.getLogger("stranger_club")
 
 CONFIRMED = "CONFIRMED"
 PENDING = "PENDING"
+PAYMENT_AWAITING_PROOF = "AWAITING_PROOF"
 PAYMENT_SUBMITTED = "SUBMITTED"
 PAYMENT_VERIFIED = "VERIFIED"
 PAYMENT_REJECTED = "REJECTED"
+PROOF_PENDING = "PENDING"
+PROOF_ACCEPTED = "ACCEPTED"
+PROOF_REJECTED = "REJECTED"
+PROOF_SUPERSEDED = "SUPERSEDED"
 REJECTED = "REJECTED"
 WAITLISTED = "WAITLISTED"
 CANCELLED = "CANCELLED"
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+QR_MAX_UPLOAD_BYTES = 2 * 1024 * 1024
 ALLOWED_FORMATS = {"JPEG": (".jpg", "image/jpeg"), "PNG": (".png", "image/png"), "WEBP": (".webp", "image/webp")}
+UTR_PATTERN = re.compile(r"^[A-Za-z0-9]{6,30}$")
+# Payment never transitions on its own — VERIFIED and REJECTED only ever
+# happen via an explicit organizer review (see review_payment). Opening a UPI
+# app, returning from it, or uploading a proof never appears here: none of
+# those are payment confirmation. REJECTED -> SUBMITTED is a resubmission.
+# VERIFIED has no outgoing edges: once verified, always verified, even if the
+# registration is later cancelled (see cancel_registration).
+VALID_PAYMENT_TRANSITIONS = {
+    PAYMENT_AWAITING_PROOF: {PAYMENT_SUBMITTED},
+    PAYMENT_SUBMITTED: {PAYMENT_VERIFIED, PAYMENT_REJECTED},
+    PAYMENT_REJECTED: {PAYMENT_SUBMITTED},
+    PAYMENT_VERIFIED: set(),
+}
 VALID_EVENT_TRANSITIONS = {
     "DRAFT": {"OPEN", "CANCELLED"}, "OPEN": {"FULL", "ONGOING", "CANCELLED"},
     "FULL": {"OPEN", "ONGOING", "CANCELLED"}, "ONGOING": {"COMPLETED", "CANCELLED"},
@@ -87,6 +112,27 @@ def transition_registration(
     session.flush()
 
 
+def transition_payment(
+    session: Session, payment: Payment, to_status: str, *, event_type: str,
+    actor_type: str, actor_id: int | None, metadata: dict | None = None,
+) -> None:
+    """The single place a Payment's status is ever changed. Enforces
+    VALID_PAYMENT_TRANSITIONS and records an attributed, before/after audit
+    entry — callers never assign `.status` directly. There is deliberately no
+    path into VERIFIED except an explicit organizer review (see
+    review_payment): nothing about submitting a proof, opening a UPI app, or
+    the player's own client state can ever move a Payment into VERIFIED."""
+    from_status = payment.status
+    if to_status not in VALID_PAYMENT_TRANSITIONS.get(from_status, set()):
+        raise api_error(409, "INVALID_STATE_TRANSITION", f"Cannot move a payment from {from_status} to {to_status}")
+    payment.status = to_status
+    audit(
+        session, event_type, "payment", payment.id, metadata,
+        actor_type=actor_type, actor_id=actor_id, before={"status": from_status}, after={"status": to_status},
+    )
+    session.flush()
+
+
 def match_counts(session: Session, match_id: int) -> dict[str, int]:
     registration_rows = session.execute(
         select(Registration.status, func.count(Registration.id)).where(Registration.match_id == match_id).group_by(Registration.status)
@@ -99,7 +145,7 @@ def match_counts(session: Session, match_id: int) -> dict[str, int]:
     return {
         "confirmed": registrations.get(CONFIRMED, 0), "pending": registrations.get(PENDING, 0),
         "waitlisted": registrations.get(WAITLISTED, 0), "payment_submitted": payments.get(PAYMENT_SUBMITTED, 0),
-        "collected_amount": session.scalar(select(func.coalesce(func.sum(Payment.amount), 0)).join(Registration).where(Registration.match_id == match_id, Payment.status == PAYMENT_VERIFIED)) or 0,
+        "collected_amount": session.scalar(select(func.coalesce(func.sum(Payment.amount_due), 0)).join(Registration).where(Registration.match_id == match_id, Payment.status == PAYMENT_VERIFIED)) or 0,
     }
 
 
@@ -114,29 +160,95 @@ def match_to_response(session: Session, match: Match) -> dict:
         "id": match.id, "public_id": match.public_id, "name": match.name, "date": match.date,
         "start_time": match.start_time, "end_time": match.end_time, "venue": match.venue,
         "capacity": match.capacity, "fee": match.fee, "registration_deadline": match.registration_deadline,
-        "upi_id": match.upi_id, "status": match.status, "confirmed_count": summary["confirmed"],
+        "payment_configuration": payment_configuration_to_response(match.payment_configuration),
+        "status": match.status, "confirmed_count": summary["confirmed"],
         "pending_count": summary["pending"], "payment_submitted_count": summary["payment_submitted"],
         "waitlist_count": summary["waitlisted"], "available_slots": summary["available"],
         "collected_amount": summary["collected_amount"],
     }
 
 
-def payment_to_response(payment: Payment, include_proof: bool = False) -> dict:
-    return {"id": payment.id, "amount": payment.amount, "status": payment.status, "submitted_at": payment.submitted_at,
-            "verified_at": payment.verified_at, "rejection_reason": payment.rejection_reason,
-            "screenshot_url": f"/api/payment-proofs/{payment.screenshot_token}" if include_proof else None}
+def payment_configuration_to_response(config: EventPaymentConfiguration) -> dict:
+    return {
+        "payee_upi_id": config.payee_upi_id, "payee_name": config.payee_name, "qr_source": config.qr_source,
+        "has_custom_qr": config.qr_source == "UPLOADED" and bool(config.qr_storage_key),
+        "updated_at": config.updated_at,
+    }
 
 
-def registration_to_response(registration: Registration, include_proof: bool = False) -> dict:
+def build_upi_uri(payee_upi_id: str, payee_name: str, amount: int) -> str:
+    """Server-authoritative UPI deep-link. Always built from a Payment's own
+    frozen snapshot fields (see Payment model) — never from live event
+    configuration and never overridable by anything the client sends."""
+    from urllib.parse import quote
+    return f"upi://pay?pa={quote(payee_upi_id)}&pn={quote(payee_name)}&am={amount}&cu=INR"
+
+
+def _current_proof(payment: Payment) -> PaymentProof | None:
+    """The proof a viewer should currently see: the one PENDING proof if
+    there is one, otherwise the most recently uploaded proof regardless of
+    its terminal status (so a VERIFIED/REJECTED payment still shows what was
+    reviewed)."""
+    if not payment.proofs:
+        return None
+    pending = next((p for p in payment.proofs if p.status == PROOF_PENDING), None)
+    return pending or max(payment.proofs, key=lambda p: p.uploaded_at)
+
+
+def _find_duplicate_proofs(session: Session, proof: PaymentProof) -> list[dict]:
+    """Exact SHA-256 matches of this proof's screenshot on a *different*
+    payment. A deterministic signal for the organizer to look at, never an
+    automatic fraud determination — see PAYMENT_PROOF_SUBMITTED audit entry
+    for the same computation at submission time."""
+    rows = session.execute(
+        select(PaymentProof, Registration)
+        .join(Payment, PaymentProof.payment_id == Payment.id)
+        .join(Registration, Payment.registration_id == Registration.id)
+        .where(PaymentProof.screenshot_hash == proof.screenshot_hash, Payment.id != proof.payment_id)
+    ).all()
+    return [{"proof_id": p.id, "registration_id": r.id, "player_name": r.name} for p, r in rows]
+
+
+def payment_to_response(payment: Payment | None, *, viewer: str = "player", session: Session | None = None) -> dict | None:
+    """viewer='player' returns the minimal, never-implies-success view (see
+    schemas.PaymentResponse); viewer='organizer' additionally includes the
+    screenshot, UTR, pending-proof identity, and cross-registration duplicate
+    warnings needed for review. Player responses never include any of the
+    organizer-only fields, regardless of what's passed."""
+    if not payment:
+        return None
+    current = _current_proof(payment)
+    data = {
+        "id": payment.id, "status": payment.status, "amount_due": payment.amount_due,
+        "payee_upi_id_snapshot": payment.payee_upi_id_snapshot, "payee_name_snapshot": payment.payee_name_snapshot,
+        "qr_source_snapshot": payment.qr_source_snapshot,
+        "upi_uri": build_upi_uri(payment.payee_upi_id_snapshot, payment.payee_name_snapshot, payment.amount_due),
+        "qr_image_url": f"/api/registrations/{payment.registration.public_id}/payment-qr" if payment.qr_source_snapshot == "UPLOADED" else None,
+        "submitted_at": payment.submitted_at, "verified_at": payment.verified_at, "rejection_reason": payment.rejection_reason,
+        "utr_reference": current.utr_reference if current else None,
+    }
+    if viewer == "organizer":
+        pending = next((p for p in payment.proofs if p.status == PROOF_PENDING), None)
+        data["screenshot_url"] = f"/api/payment-proofs/{current.id}" if current else None
+        data["pending_proof_id"] = pending.id if pending else None
+        data["proof_count"] = len(payment.proofs)
+        data["duplicate_of"] = _find_duplicate_proofs(session, current) if session and current else []
+    return data
+
+
+def registration_to_response(registration: Registration, *, viewer: str = "player", session: Session | None = None) -> dict:
     return {"id": registration.id, "public_id": registration.public_id, "match_id": registration.match_id,
             "name": registration.name, "phone": registration.phone, "email": registration.email, "status": registration.status,
             "preferred_position": registration.preferred_position or "NO_PREFERENCE", "assigned_position": registration.assigned_position,
             "created_at": registration.created_at, "updated_at": registration.updated_at,
-            "payment": payment_to_response(registration.payment, include_proof) if registration.payment else None}
+            "payment": payment_to_response(registration.payment, viewer=viewer, session=session)}
 
 
 def get_public_match(session: Session, public_id: str) -> Match:
-    match = session.scalar(select(Match).where(Match.public_id == public_id, Match.status.in_(("OPEN", "FULL", "ONGOING"))))
+    match = session.scalar(
+        select(Match).options(joinedload(Match.payment_configuration))
+        .where(Match.public_id == public_id, Match.status.in_(("OPEN", "FULL", "ONGOING")))
+    )
     if not match:
         raise api_error(404, "EVENT_NOT_FOUND", "Event not found")
     return match
@@ -157,13 +269,71 @@ def assert_event_owner(match: Match, organizer: Organizer) -> None:
 def create_match(session: Session, payload: MatchCreate, organizer: Organizer) -> Match:
     if payload.registration_deadline > datetime.combine(payload.date, payload.start_time):
         raise api_error(422, "VALIDATION_ERROR", "Registration deadline must be before event start")
-    match = Match(public_id=uuid.uuid4().hex[:16], owner_organizer_id=organizer.id, **payload.model_dump())
+    data = payload.model_dump()
+    payee_upi_id = data.pop("upi_id")
+    payee_name = data.pop("payee_name")
+    match = Match(public_id=uuid.uuid4().hex[:16], owner_organizer_id=organizer.id, **data)
     session.add(match)
+    session.flush()
+    # Every event gets a payment configuration atomically at creation — there
+    # is no window where a match exists but registering against it would have
+    # nothing to snapshot a Payment from.
+    config = EventPaymentConfiguration(
+        match_id=match.id, payee_upi_id=payee_upi_id, payee_name=payee_name,
+        qr_source="GENERATED", updated_by_organizer_id=organizer.id,
+    )
+    session.add(config)
     session.flush()
     audit(session, "EVENT_CREATED", "event", match.id, {"public_id": match.public_id}, actor_type="ORGANIZER", actor_id=organizer.id)
     session.commit(); session.refresh(match)
     logger.info("event_created event_id=%s", match.id)
     return match
+
+
+def update_payment_configuration(session: Session, match: Match, payload: PaymentConfigurationUpdate, organizer: Organizer) -> EventPaymentConfiguration:
+    """Editing an event's live payment configuration. Deliberately
+    unrestricted even after registrations/payments exist: every Payment
+    already froze its own snapshot at creation time (see Payment model), so
+    an edit here can never silently reinterpret a historical payment —
+    there's no correctness reason to block it, only an audit trail need,
+    which is recorded below."""
+    config = match.payment_configuration
+    if not config:
+        raise api_error(404, "RESOURCE_NOT_FOUND", "Payment configuration not found")
+    changes = payload.model_dump(exclude_unset=True)
+    if changes.get("qr_source") == "UPLOADED":
+        raise api_error(422, "VALIDATION_ERROR", "Upload a QR image to switch to a custom QR")
+    before = {"payee_upi_id": config.payee_upi_id, "payee_name": config.payee_name, "qr_source": config.qr_source}
+    for field, value in changes.items():
+        setattr(config, field, value)
+    if changes.get("qr_source") == "GENERATED":
+        config.qr_storage_key = None
+    config.updated_by_organizer_id = organizer.id
+    audit(
+        session, "PAYMENT_CONFIG_UPDATED", "event_payment_configuration", config.id, {"fields": sorted(changes)},
+        actor_type="ORGANIZER", actor_id=organizer.id, before=before,
+        after={"payee_upi_id": config.payee_upi_id, "payee_name": config.payee_name, "qr_source": config.qr_source},
+    )
+    session.commit(); session.refresh(config)
+    return config
+
+
+async def set_payment_configuration_qr(session: Session, match: Match, upload: UploadFile, storage: Storage, organizer: Organizer) -> EventPaymentConfiguration:
+    config = match.payment_configuration
+    if not config:
+        raise api_error(404, "RESOURCE_NOT_FOUND", "Payment configuration not found")
+    content, _digest, _content_type, image_format = await read_and_validate_image(upload, max_bytes=QR_MAX_UPLOAD_BYTES)
+    key = persist_image(storage, content, image_format)
+    before = {"qr_source": config.qr_source}
+    config.qr_source = "UPLOADED"
+    config.qr_storage_key = key
+    config.updated_by_organizer_id = organizer.id
+    audit(
+        session, "PAYMENT_CONFIG_UPDATED", "event_payment_configuration", config.id, {"field": "qr"},
+        actor_type="ORGANIZER", actor_id=organizer.id, before=before, after={"qr_source": "UPLOADED"},
+    )
+    session.commit(); session.refresh(config)
+    return config
 
 
 def update_match(session: Session, match: Match, payload: EventUpdate, organizer: Organizer) -> Match:
@@ -213,7 +383,10 @@ def create_registration(session: Session, match: Match, payload: RegistrationCre
     # concurrent active registration for the same (event, user) can never be
     # written, full stop.
     session.rollback(); session.execute(text("BEGIN IMMEDIATE"))
-    match = session.scalar(select(Match).where(Match.id == match.id))
+    match = session.scalar(select(Match).options(joinedload(Match.payment_configuration)).where(Match.id == match.id))
+    config = match.payment_configuration
+    if not config:
+        raise api_error(409, "EVENT_PAYMENT_NOT_CONFIGURED", "This event has no payment configuration")
     # Phone comes from the OTP-verified session, never from the request payload.
     phone = user.phone
     confirmed = match_counts(session, match.id)["confirmed"]
@@ -224,6 +397,15 @@ def create_registration(session: Session, match: Match, payload: RegistrationCre
     )
     session.add(registration)
     try:
+        session.flush()
+        # Freeze this event's payment configuration onto the Payment row now,
+        # for the lifetime of this record — see Payment model docstring.
+        payment = Payment(
+            registration_id=registration.id, status=PAYMENT_AWAITING_PROOF, amount_due=match.fee,
+            payee_upi_id_snapshot=config.payee_upi_id, payee_name_snapshot=config.payee_name,
+            qr_source_snapshot=config.qr_source, qr_storage_key_snapshot=config.qr_storage_key,
+        )
+        session.add(payment)
         session.flush()
         audit(
             session, "PLAYER_WAITLISTED" if registration.status == WAITLISTED else "REGISTRATION_CREATED",
@@ -264,80 +446,181 @@ def cancel_registration(session: Session, registration_id: int, *, actor_type: s
     return registration
 
 
-async def store_payment_proof(upload: UploadFile, uploads_dir: Path) -> tuple[str, str]:
+def validate_utr(value: str | None) -> str | None:
+    """UTR is optional, player-supplied evidence — never verified against any
+    real payment network, never treated as proof of payment on its own. Only
+    a loose syntax/length check; there is no single universal UTR format."""
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if not UTR_PATTERN.match(value):
+        raise api_error(422, "VALIDATION_ERROR", "UTR/reference should be 6-30 letters and numbers")
+    return value
+
+
+async def read_and_validate_image(upload: UploadFile, *, max_bytes: int = MAX_UPLOAD_BYTES) -> tuple[bytes, str, str, str]:
+    """Validates extension, Content-Type header, size, and — via an actual
+    Pillow decode, not just header inspection — the image's real magic
+    bytes/format. Returns (content, sha256_hex, content_type, image_format);
+    does not write anything to storage."""
     if Path(upload.filename or "").suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"} or upload.content_type not in {"image/jpeg", "image/png", "image/webp"}:
         raise api_error(400, "INVALID_UPLOAD", "Upload a JPEG, PNG, or WEBP image")
-    content = await upload.read(MAX_UPLOAD_BYTES + 1)
-    if len(content) > MAX_UPLOAD_BYTES: raise api_error(413, "UPLOAD_TOO_LARGE", "Payment screenshot must be 5 MB or smaller")
+    content = await upload.read(max_bytes + 1)
+    if len(content) > max_bytes: raise api_error(413, "UPLOAD_TOO_LARGE", "File must be 5 MB or smaller")
     try:
-        from io import BytesIO
         image = Image.open(BytesIO(content)); image.verify()
         image = Image.open(BytesIO(content)); image_format = image.format
     except (UnidentifiedImageError, OSError):
         raise api_error(400, "INVALID_UPLOAD", "Invalid image")
     if image_format not in ALLOWED_FORMATS: raise api_error(400, "INVALID_UPLOAD", "Upload a JPEG, PNG, or WEBP image")
-    filename = f"{uuid.uuid4().hex}{ALLOWED_FORMATS[image_format][0]}"
-    uploads_dir.mkdir(parents=True, exist_ok=True); (uploads_dir / filename).write_bytes(content)
-    return filename, uuid.uuid4().hex
+    digest = hashlib.sha256(content).hexdigest()
+    return content, digest, ALLOWED_FORMATS[image_format][1], image_format
 
 
-async def submit_payment(session: Session, registration_key: str, upload: UploadFile, uploads_dir: Path, user_id: int) -> Registration:
-    # The upload itself (network I/O + Pillow decode) happens outside any lock,
-    # same as before — only the guard-check-then-write of the Payment row is
-    # serialised, which is the part that was previously racy: two rapid
-    # submissions could both pass the "not already in review" guard before
-    # either committed, both write a file to disk, and race on the final DB
-    # write, leaving one file orphaned on disk with no referencing row.
-    registration = session.scalar(select(Registration).options(joinedload(Registration.match), joinedload(Registration.payment)).where(Registration.public_id == registration_key))
+def persist_image(storage: Storage, content: bytes, image_format: str) -> str:
+    """Generates an opaque storage key (never derived from user input) and
+    writes the bytes. No filename, path, or extension the caller supplied is
+    ever used — this is what makes path traversal structurally impossible."""
+    key = f"{uuid.uuid4().hex}{ALLOWED_FORMATS[image_format][0]}"
+    storage.put(key, content)
+    return key
+
+
+def _load_registration_for_payment(session: Session, registration_key: str) -> Registration:
+    registration = session.scalar(
+        select(Registration).options(
+            joinedload(Registration.match), joinedload(Registration.payment).joinedload(Payment.proofs),
+        ).where(Registration.public_id == registration_key)
+    )
     if not registration: raise api_error(404, "RESOURCE_NOT_FOUND", "Registration not found")
-    assert_registration_owner(registration, user_id)
+    return registration
+
+
+def _assert_registration_open_for_payment(registration: Registration) -> None:
     if registration.status == WAITLISTED: raise api_error(409, "EVENT_FULL", "This registration is on the waitlist")
     if registration.status == CONFIRMED: raise api_error(409, "PAYMENT_ALREADY_VERIFIED", "This registration is already confirmed")
     if registration.status == CANCELLED: raise api_error(409, "INVALID_STATE_TRANSITION", "This registration has been cancelled")
 
-    filename, token = await store_payment_proof(upload, uploads_dir)
+
+async def submit_payment_proof(session: Session, registration_key: str, upload: UploadFile, utr: str | None, storage: Storage, user_id: int) -> Registration:
+    """Appends a new PaymentProof. Never sets Payment to VERIFIED — only an
+    organizer review can do that (see review_payment). A player may resubmit
+    at any point before VERIFIED, including while one proof is still PENDING
+    (e.g. they realise they picked the wrong screenshot); the previously
+    PENDING proof is marked SUPERSEDED, never deleted or overwritten.
+
+    Two-phase, same shape as the Phase 2B concurrency fix: the upload itself
+    (network I/O + Pillow decode + hash) happens with no lock held; only the
+    guard-check-then-write of the proof row is serialised under BEGIN
+    IMMEDIATE, with every guard re-checked after the lock is acquired.
+    """
+    utr = validate_utr(utr)
+    registration = _load_registration_for_payment(session, registration_key)
+    assert_registration_owner(registration, user_id)
+    _assert_registration_open_for_payment(registration)
+    payment = registration.payment
+
+    content, digest, content_type, image_format = await read_and_validate_image(upload)
+
+    # Idempotent-retry short-circuit: if the caller's own still-PENDING proof
+    # already has this exact hash, this is almost certainly the same logical
+    # request replayed (e.g. a mobile client that timed out waiting for the
+    # response and retried) — return current state rather than creating a
+    # duplicate row or raising a false conflict.
+    existing_pending = next((p for p in payment.proofs if p.status == PROOF_PENDING), None)
+    if existing_pending and existing_pending.submitted_by_user_id == user_id and existing_pending.screenshot_hash == digest:
+        return registration
+    if payment.status == PAYMENT_VERIFIED:
+        raise api_error(409, "PAYMENT_ALREADY_VERIFIED", "This registration is already confirmed")
+
+    key = persist_image(storage, content, image_format)
 
     session.rollback(); session.execute(text("BEGIN IMMEDIATE"))
-    registration = session.scalar(select(Registration).options(joinedload(Registration.match), joinedload(Registration.payment)).where(Registration.public_id == registration_key))
-    if not registration: raise api_error(404, "RESOURCE_NOT_FOUND", "Registration not found")
-    # Re-check every guard inside the lock: state may have changed since the
-    # pre-upload check above (e.g. a concurrent submission just claimed "in review").
-    if registration.status in (WAITLISTED, CONFIRMED, CANCELLED) or (registration.payment and registration.payment.status == PAYMENT_SUBMITTED):
-        (uploads_dir / filename).unlink(missing_ok=True)  # avoid leaving an orphaned file behind
-        if registration.status == WAITLISTED: raise api_error(409, "EVENT_FULL", "This registration is on the waitlist")
-        if registration.status == CONFIRMED: raise api_error(409, "PAYMENT_ALREADY_VERIFIED", "This registration is already confirmed")
-        if registration.status == CANCELLED: raise api_error(409, "INVALID_STATE_TRANSITION", "This registration has been cancelled")
-        raise api_error(409, "PAYMENT_IN_REVIEW", "A payment proof is already being reviewed")
-    if registration.payment:
-        old = uploads_dir / registration.payment.screenshot_path
-        if old.is_file(): old.unlink()
-        payment = registration.payment; payment.amount = registration.match.fee; payment.screenshot_path = filename; payment.screenshot_token = token
-        payment.status = PAYMENT_SUBMITTED; payment.submitted_at = now_ist(); payment.verified_at = None; payment.rejection_reason = None
-    else:
-        payment = Payment(amount=registration.match.fee, screenshot_path=filename, screenshot_token=token, status=PAYMENT_SUBMITTED); registration.payment = payment
+    registration = _load_registration_for_payment(session, registration_key)
+    payment = registration.payment
+    try:
+        _assert_registration_open_for_payment(registration)
+        if payment.status == PAYMENT_VERIFIED:
+            raise api_error(409, "PAYMENT_ALREADY_VERIFIED", "This registration is already confirmed")
+        existing_pending = next((p for p in payment.proofs if p.status == PROOF_PENDING), None)
+        if existing_pending and existing_pending.submitted_by_user_id == user_id and existing_pending.screenshot_hash == digest:
+            storage.delete(key)  # this exact upload already exists as the pending proof; nothing new to keep
+            session.commit()
+            return registration
+    except HTTPException:
+        storage.delete(key)  # avoid leaving an orphaned file behind
+        raise
+
+    if existing_pending:
+        existing_pending.status = PROOF_SUPERSEDED
+        existing_pending.superseded_at = now_ist()
+    duplicate_hits = _find_duplicate_proofs_by_hash(session, digest, exclude_payment_id=payment.id)
+    proof = PaymentProof(
+        payment_id=payment.id, storage_key=key, screenshot_hash=digest, file_size=len(content),
+        content_type=content_type, utr_reference=utr, submitted_by_user_id=user_id, status=PROOF_PENDING,
+    )
+    session.add(proof)
     session.flush()
-    audit(session, "PAYMENT_SUBMITTED", "payment", payment.id, {"registration_id": registration.id}, actor_type="PLAYER", actor_id=user_id)
+    if payment.status != PAYMENT_SUBMITTED:
+        transition_payment(session, payment, PAYMENT_SUBMITTED, event_type="PAYMENT_PROOF_SUBMITTED", actor_type="PLAYER", actor_id=user_id, metadata={"proof_id": proof.id})
+    payment.submitted_at = payment.submitted_at or now_ist()
+    payment.rejection_reason = None
+    audit(
+        session, "PAYMENT_PROOF_SUBMITTED", "payment_proof", proof.id,
+        {"payment_id": payment.id, "screenshot_hash": digest, "duplicate_of": [d["proof_id"] for d in duplicate_hits]},
+        actor_type="PLAYER", actor_id=user_id,
+    )
     session.commit(); session.refresh(registration)
-    logger.info("payment_submitted registration_id=%s payment_id=%s", registration.id, registration.payment.id)
+    logger.info("payment_proof_submitted registration_id=%s payment_id=%s proof_id=%s", registration.id, payment.id, proof.id)
     return registration
 
 
-def verify_payment(session: Session, payment_id: int, approve: bool, *, actor_id: int, reason: str | None = None) -> Registration:
+def _find_duplicate_proofs_by_hash(session: Session, screenshot_hash: str, *, exclude_payment_id: int) -> list[dict]:
+    rows = session.execute(
+        select(PaymentProof, Registration)
+        .join(Payment, PaymentProof.payment_id == Payment.id)
+        .join(Registration, Payment.registration_id == Registration.id)
+        .where(PaymentProof.screenshot_hash == screenshot_hash, Payment.id != exclude_payment_id)
+    ).all()
+    return [{"proof_id": p.id, "registration_id": r.id, "player_name": r.name} for p, r in rows]
+
+
+def review_payment(session: Session, payment_id: int, approve: bool, *, actor_id: int, reason: str | None = None) -> Registration:
+    """The single place a Payment is ever reviewed. Requires exactly one
+    PENDING proof (an invariant the database also enforces — see
+    uq_payment_proof_one_pending); a SUBMITTED payment with none would be a
+    data-integrity bug, not a normal 409, so it raises rather than guessing
+    which proof to act on."""
     session.rollback(); session.execute(text("BEGIN IMMEDIATE"))
-    payment = session.scalar(select(Payment).options(joinedload(Payment.registration).joinedload(Registration.match)).where(Payment.id == payment_id))
+    payment = session.scalar(
+        select(Payment).options(joinedload(Payment.registration).joinedload(Registration.match), joinedload(Payment.proofs))
+        .where(Payment.id == payment_id)
+    )
     if not payment: raise api_error(404, "RESOURCE_NOT_FOUND", "Payment not found")
     if payment.status != PAYMENT_SUBMITTED: raise api_error(409, "PAYMENT_ALREADY_REVIEWED", "Payment has already been reviewed")
+    pending = next((p for p in payment.proofs if p.status == PROOF_PENDING), None)
+    if not pending:
+        raise RuntimeError(f"Payment {payment.id} is SUBMITTED but has no PENDING proof")
     registration = payment.registration
     if approve:
         if match_counts(session, registration.match_id)["confirmed"] >= registration.match.capacity:
             transition_registration(session, registration, WAITLISTED, event_type="PLAYER_WAITLISTED", actor_type="ORGANIZER", actor_id=actor_id, metadata={"reason": "capacity"})
-            payment.status = PAYMENT_REJECTED; payment.rejection_reason = "Event filled before payment could be confirmed"
+            transition_payment(session, payment, PAYMENT_REJECTED, event_type="PAYMENT_REJECTED", actor_type="ORGANIZER", actor_id=actor_id, metadata={"reason": "capacity"})
+            payment.rejection_reason = "Event filled before payment could be confirmed"
+            pending.status = PROOF_REJECTED; pending.rejection_reason = payment.rejection_reason
         else:
             transition_registration(session, registration, CONFIRMED, event_type="PAYMENT_VERIFIED", actor_type="ORGANIZER", actor_id=actor_id, metadata={"payment_id": payment.id})
-            payment.status = PAYMENT_VERIFIED; payment.verified_at = now_ist()
+            transition_payment(session, payment, PAYMENT_VERIFIED, event_type="PAYMENT_VERIFIED", actor_type="ORGANIZER", actor_id=actor_id, metadata={"proof_id": pending.id})
+            payment.verified_at = now_ist()
+            pending.status = PROOF_ACCEPTED
     else:
         transition_registration(session, registration, REJECTED, event_type="PAYMENT_REJECTED", actor_type="ORGANIZER", actor_id=actor_id, metadata={"payment_id": payment.id})
-        payment.status = PAYMENT_REJECTED; payment.rejection_reason = reason; payment.verified_at = now_ist()
+        transition_payment(session, payment, PAYMENT_REJECTED, event_type="PAYMENT_REJECTED", actor_type="ORGANIZER", actor_id=actor_id, metadata={"proof_id": pending.id})
+        payment.rejection_reason = reason
+        pending.status = PROOF_REJECTED; pending.rejection_reason = reason
+    pending.reviewed_by_organizer_id = actor_id; pending.reviewed_at = now_ist()
     _refresh_full_status(session, registration.match)
     session.commit(); session.refresh(registration)
     logger.info("payment_reviewed payment_id=%s approved=%s registration_id=%s", payment.id, approve, registration.id)
@@ -389,5 +672,7 @@ def backfill_missing_event_ownership(session: Session) -> None:
 
 def seed_database(session: Session, owner_organizer_id: int | None = None) -> None:
     if session.scalar(select(func.count(Match.id))) > 0: return
-    match = Match(public_id="sunday-cricket-2026", name="Sunday Cricket", date=date(2026, 8, 23), start_time=time(7), end_time=time(10), venue="PlayArena, Bellandur", capacity=22, fee=300, registration_deadline=datetime(2026, 8, 22, 20), upi_id="strangerclub@upi", status="OPEN", owner_organizer_id=owner_organizer_id)
-    session.add(match); session.commit(); logger.info("seed_event_created public_id=%s", match.public_id)
+    match = Match(public_id="sunday-cricket-2026", name="Sunday Cricket", date=date(2026, 8, 23), start_time=time(7), end_time=time(10), venue="PlayArena, Bellandur", capacity=22, fee=300, registration_deadline=datetime(2026, 8, 22, 20), status="OPEN", owner_organizer_id=owner_organizer_id)
+    session.add(match); session.flush()
+    session.add(EventPaymentConfiguration(match_id=match.id, payee_upi_id="strangerclub@upi", payee_name="Stranger Club", qr_source="GENERATED", updated_by_organizer_id=owner_organizer_id))
+    session.commit(); logger.info("seed_event_created public_id=%s", match.public_id)

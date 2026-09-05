@@ -18,6 +18,17 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 ACTIVE_REGISTRATION_STATUSES = ("PENDING", "WAITLISTED", "CONFIRMED", "REJECTED")
 ALL_REGISTRATION_STATUSES = ACTIVE_REGISTRATION_STATUSES + ("CANCELLED",)
 
+# Payment never observes the underlying bank/UPI transaction — these are the
+# only states that can ever exist. AWAITING_PROOF is the state from the
+# moment a Registration (and its Payment row) is created; there is no
+# "player says they paid" state distinct from having submitted a proof.
+PAYMENT_STATUSES = ("AWAITING_PROOF", "SUBMITTED", "VERIFIED", "REJECTED")
+# A proof's own lifecycle, independent of its Payment's current status:
+# PENDING -> ACCEPTED | REJECTED (organizer reviewed it), or PENDING ->
+# SUPERSEDED (the player uploaded a replacement before it was reviewed).
+# ACCEPTED/REJECTED/SUPERSEDED are all terminal for that proof row.
+PROOF_STATUSES = ("PENDING", "ACCEPTED", "REJECTED", "SUPERSEDED")
+
 
 class Base(DeclarativeBase):
     pass
@@ -45,8 +56,6 @@ class Match(Base):
     capacity: Mapped[int] = mapped_column(Integer)
     fee: Mapped[int] = mapped_column(Integer)
     registration_deadline: Mapped[datetime] = mapped_column(DateTime)
-    upi_id: Mapped[str] = mapped_column(String(120))
-    qr_code_path: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="ACTIVE")
     # The organizer who owns this event. NULL only for rows that predate event
     # ownership; backfilled where unambiguous during the Phase 2B migration
@@ -56,6 +65,47 @@ class Match(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist, onupdate=now_ist)
 
     registrations: Mapped[list[Registration]] = relationship(back_populates="match", cascade="all, delete-orphan")
+    payment_configuration: Mapped[EventPaymentConfiguration | None] = relationship(
+        back_populates="match", uselist=False, cascade="all, delete-orphan"
+    )
+
+
+class EventPaymentConfiguration(Base):
+    """The organizer's current, mutable payment settings for an event.
+
+    Deliberately a separate 1:1 table rather than columns on Match: this is a
+    payment-sensitive, organizer-editable surface, and every Payment freezes
+    a snapshot of it at creation time (see Payment below) rather than ever
+    reading it live again. Editing this row never rewrites history.
+    """
+    __tablename__ = "event_payment_configurations"
+    __table_args__ = (
+        CheckConstraint("qr_source IN ('GENERATED','UPLOADED')", name="ck_payment_config_qr_source_valid"),
+        CheckConstraint(
+            "(qr_source = 'UPLOADED' AND qr_storage_key IS NOT NULL) OR (qr_source = 'GENERATED' AND qr_storage_key IS NULL)",
+            name="ck_payment_config_qr_storage_consistent",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    match_id: Mapped[int] = mapped_column(ForeignKey("matches.id"), unique=True, index=True)
+    payee_upi_id: Mapped[str] = mapped_column(String(120))
+    payee_name: Mapped[str] = mapped_column(String(80), default="Stranger Club")
+    qr_source: Mapped[str] = mapped_column(String(20), default="GENERATED")
+    # Opaque storage key for an organizer-uploaded QR image. Never exposed to
+    # a client directly — only ever resolved server-side. NULL when qr_source
+    # is GENERATED (the client renders a QR from the server-authoritative
+    # UPI URI itself; see Payment.qr_source_snapshot).
+    qr_storage_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist, onupdate=now_ist)
+    # Nullable for the same reason as Match.owner_organizer_id: a migration
+    # backfilling this row for a pre-existing event can run before any
+    # organizer account exists. Purely informational (never used for
+    # authorization), so unlike owner_organizer_id it needs no startup
+    # backfill of its own.
+    updated_by_organizer_id: Mapped[int | None] = mapped_column(ForeignKey("organizers.id"), nullable=True)
+
+    match: Mapped[Match] = relationship(back_populates="payment_configuration")
 
 
 class Player(Base):
@@ -128,19 +178,75 @@ class Registration(Base):
 
 
 class Payment(Base):
+    """The player-specific payment expectation and current state for one
+    Registration. Created alongside the Registration (status AWAITING_PROOF)
+    and never re-reads EventPaymentConfiguration afterward: amount_due and
+    the payee_*/qr_*_snapshot fields are frozen at creation time, so an
+    organizer editing the event's live payment configuration later can never
+    silently change what an existing Payment record represents.
+    """
     __tablename__ = "payments"
+    __table_args__ = (
+        CheckConstraint(f"status IN {PAYMENT_STATUSES}", name="ck_payment_status_valid"),
+        CheckConstraint(
+            "(qr_source_snapshot = 'UPLOADED' AND qr_storage_key_snapshot IS NOT NULL) "
+            "OR (qr_source_snapshot = 'GENERATED' AND qr_storage_key_snapshot IS NULL)",
+            name="ck_payment_qr_snapshot_consistent",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     registration_id: Mapped[int] = mapped_column(ForeignKey("registrations.id"), unique=True, index=True)
-    amount: Mapped[int] = mapped_column(Integer)
-    screenshot_path: Mapped[str] = mapped_column(String(255))
-    screenshot_token: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    status: Mapped[str] = mapped_column(String(32), default="PAYMENT_SUBMITTED", index=True)
-    submitted_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
+    status: Mapped[str] = mapped_column(String(32), default="AWAITING_PROOF", index=True)
+    # --- Frozen at creation time from EventPaymentConfiguration. Never re-read. ---
+    amount_due: Mapped[int] = mapped_column(Integer)
+    payee_upi_id_snapshot: Mapped[str] = mapped_column(String(120))
+    payee_name_snapshot: Mapped[str] = mapped_column(String(80))
+    qr_source_snapshot: Mapped[str] = mapped_column(String(20))
+    qr_storage_key_snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # --- Current review state ---
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     registration: Mapped[Registration] = relationship(back_populates="payment")
+    proofs: Mapped[list[PaymentProof]] = relationship(
+        back_populates="payment", cascade="all, delete-orphan", order_by="PaymentProof.uploaded_at"
+    )
+
+
+class PaymentProof(Base):
+    """One submitted screenshot (plus optional UTR). Append-only: rows are
+    never deleted or overwritten to change their evidence — only `status`,
+    `reviewed_by_organizer_id`, `reviewed_at`, `rejection_reason`, and
+    `superseded_at` ever change after creation. A rejected or superseded
+    proof stays in the table forever as the historical record it was."""
+    __tablename__ = "payment_proofs"
+    __table_args__ = (
+        CheckConstraint(f"status IN {PROOF_STATUSES}", name="ck_payment_proof_status_valid"),
+        Index(
+            "uq_payment_proof_one_pending", "payment_id", unique=True,
+            sqlite_where=text("status = 'PENDING'"),
+            postgresql_where=text("status = 'PENDING'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    payment_id: Mapped[int] = mapped_column(ForeignKey("payments.id"), index=True)
+    storage_key: Mapped[str] = mapped_column(String(255), unique=True)
+    screenshot_hash: Mapped[str] = mapped_column(String(64), index=True)
+    file_size: Mapped[int] = mapped_column(Integer)
+    content_type: Mapped[str] = mapped_column(String(40))
+    utr_reference: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
+    submitted_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    status: Mapped[str] = mapped_column(String(20), default="PENDING", index=True)
+    reviewed_by_organizer_id: Mapped[int | None] = mapped_column(ForeignKey("organizers.id"), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    payment: Mapped[Payment] = relationship(back_populates="proofs")
 
 
 class Organizer(Base):

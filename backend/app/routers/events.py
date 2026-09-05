@@ -6,7 +6,7 @@ import queue
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from ..deps import get_session
 from ..models import Match
@@ -18,7 +18,7 @@ router = APIRouter()
 
 @router.get("/api/events", response_model=list[MatchResponse])
 def public_events(session: Session = Depends(get_session)):
-    return [match_to_response(session, item) for item in session.scalars(select(Match).where(Match.status.in_(("OPEN", "FULL", "ONGOING"))).order_by(Match.date, Match.start_time)).all()]
+    return [match_to_response(session, item) for item in session.scalars(select(Match).options(joinedload(Match.payment_configuration)).where(Match.status.in_(("OPEN", "FULL", "ONGOING"))).order_by(Match.date, Match.start_time)).all()]
 
 
 @router.get("/api/events/{public_id}", response_model=MatchResponse)

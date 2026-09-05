@@ -11,7 +11,7 @@ from fastapi import Depends, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
-from .models import Match, Organizer, OrganizerSession, Payment, PlayerSession, Registration, User, now_ist
+from .models import Match, Organizer, OrganizerSession, Payment, PaymentProof, PlayerSession, Registration, User, now_ist
 from .services import api_error, event_summary
 
 PLATFORM_ADMIN = "PLATFORM_ADMIN"
@@ -115,6 +115,16 @@ def require_payment_access(payment_id: int, organizer: Organizer = Depends(requi
     if not payment or not organizer_owns_event(organizer, payment.registration.match):
         raise api_error(404, "RESOURCE_NOT_FOUND", "Payment not found")
     return payment
+
+
+def require_proof_access(proof_id: int, organizer: Organizer = Depends(require_admin), session: Session = Depends(get_session)) -> PaymentProof:
+    proof = session.scalar(
+        select(PaymentProof).options(joinedload(PaymentProof.payment).joinedload(Payment.registration).joinedload(Registration.match))
+        .where(PaymentProof.id == proof_id)
+    )
+    if not proof or not organizer_owns_event(organizer, proof.payment.registration.match):
+        raise api_error(404, "RESOURCE_NOT_FOUND", "Payment proof not found")
+    return proof
 
 
 def require_registration_access(registration_id: int, organizer: Organizer = Depends(require_admin), session: Session = Depends(get_session)) -> Registration:

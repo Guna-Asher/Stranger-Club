@@ -16,7 +16,7 @@ from backend.app.deps import (
 )
 from backend.app.main import create_app
 from backend.app.models import OrganizerSession, PlayerSession, Registration, now_ist
-from backend.app.services import verify_payment
+from backend.app.services import review_payment
 from backend.app.services_player import OTP_MAX_ATTEMPTS
 
 
@@ -30,6 +30,14 @@ def image_file():
     image = Image.new("RGB", (12, 12), "green")
     content = BytesIO(); image.save(content, format="PNG")
     return {"screenshot": ("proof.png", content.getvalue(), "image/png")}
+
+
+def different_image_file():
+    """A different screenshot from image_file() — different hash — for tests
+    that need to distinguish a genuine resubmission from an identical retry."""
+    image = Image.new("RGB", (12, 12), "blue")
+    content = BytesIO(); image.save(content, format="PNG")
+    return {"screenshot": ("proof2.png", content.getvalue(), "image/png")}
 
 
 def login(client: TestClient) -> dict[str, str]:
@@ -234,16 +242,51 @@ def test_payment_lifecycle_summary_and_idempotency(client: TestClient):
     uploaded = submit_payment(client, registration, player_headers)
     assert uploaded.status_code == 200
     assert uploaded.json()["payment"]["status"] == "SUBMITTED"
-    assert submit_payment(client, registration, player_headers).status_code == 409
+    # Resubmitting the byte-identical screenshot while still pending is an
+    # idempotent retry (e.g. a client that timed out and retried the upload),
+    # not a conflict — and must not create a second proof row.
+    retry = submit_payment(client, registration, player_headers)
+    assert retry.status_code == 200
+    assert retry.json()["payment"]["status"] == "SUBMITTED"
     pending = client.get("/api/admin/payments/pending").json()
+    assert len(pending) == 1
+    assert pending[0]["payment"]["proof_count"] == 1
     payment_id = pending[0]["payment"]["id"]
     confirmed = client.post(f"/api/admin/payments/{payment_id}/confirm", headers=headers)
     assert confirmed.status_code == 200
     assert confirmed.json()["status"] == "CONFIRMED"
     assert confirmed.json()["payment"]["status"] == "VERIFIED"
     assert client.post(f"/api/admin/payments/{payment_id}/confirm", headers=headers).status_code == 409
+    # VERIFIED is terminal: opening the UPI app or anything else on the
+    # player's side can never move it, and no further proof is accepted.
+    assert submit_payment(client, registration, player_headers).status_code == 409
     summary = client.get(f"/api/events/{event['public_id']}/summary").json()
     assert summary == {"event_id": event["public_id"], "capacity": 4, "confirmed": 1, "pending": 0, "payment_submitted": 0, "waitlisted": 0, "available": 3, "collected_amount": 350}
+
+
+def test_payment_resubmission_before_review_supersedes_previous_proof(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client)
+    registration = register(client, event["public_id"], player_headers).json()
+    first = submit_payment(client, registration, player_headers)
+    assert first.status_code == 200
+    # A different screenshot, uploaded before the organizer has reviewed
+    # anything: this is the player realising they picked the wrong file, not
+    # a retry — it must be accepted and supersede the first proof rather than
+    # being rejected as "already in review".
+    second = client.post(
+        f"/api/registrations/{registration['public_id']}/payment",
+        files=different_image_file(), headers=player_headers,
+    )
+    assert second.status_code == 200
+    assert second.json()["payment"]["status"] == "SUBMITTED"
+    pending = client.get("/api/admin/payments/pending").json()
+    assert len(pending) == 1
+    assert pending[0]["payment"]["proof_count"] == 2  # both proofs kept, nothing deleted
+    with client.app.state.session_factory() as session:
+        from backend.app.models import PaymentProof as ProofModel
+        proofs = session.query(ProofModel).filter_by(payment_id=pending[0]["payment"]["id"]).order_by(ProofModel.uploaded_at).all()
+        assert [p.status for p in proofs] == ["SUPERSEDED", "PENDING"]
 
 
 def test_payment_rejection(client: TestClient):
@@ -287,7 +330,7 @@ def test_concurrent_payment_confirmation_cannot_exceed_capacity(client: TestClie
 
     def confirm(payment_id: int):
         with client.app.state.session_factory() as session:
-            return verify_payment(session, payment_id, approve=True, actor_id=1).status
+            return review_payment(session, payment_id, approve=True, actor_id=1).status
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(confirm, pending_ids))
@@ -830,7 +873,7 @@ def test_concurrent_confirmation_after_cancellation_frees_slot(client: TestClien
 
     def confirm(payment_id: int):
         with client.app.state.session_factory() as session:
-            return verify_payment(session, payment_id, approve=True, actor_id=1).status
+            return review_payment(session, payment_id, approve=True, actor_id=1).status
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(confirm, payment_ids))
@@ -883,7 +926,7 @@ def test_concurrent_reregistration_after_cancellation_only_one_wins(client: Test
 
 
 def test_concurrent_payment_submission_has_no_race_or_orphaned_files(client: TestClient):
-    from backend.app.models import Payment as PaymentModel, Registration as RegModel
+    from backend.app.models import PaymentProof as ProofModel, Registration as RegModel
     headers = login(client); event = new_event(client, headers)
     player_headers = player_login(client, "9877400001")
     reg = register(client, event["public_id"], player_headers).json()
@@ -897,16 +940,21 @@ def test_concurrent_payment_submission_has_no_race_or_orphaned_files(client: Tes
     with ThreadPoolExecutor(max_workers=6) as pool:
         results = list(pool.map(do_submit, range(6)))
 
-    assert results.count(200) == 1
-    assert results.count(409) == 5
+    # All six requests upload byte-identical screenshots from the same
+    # player. Only the first actually creates a proof; the rest are
+    # recognised as the same logical submission (the idempotent-retry path in
+    # submit_payment_proof) and succeed without creating duplicates, rather
+    # than racing into a false conflict.
+    assert results.count(200) == 6
 
     with client.app.state.session_factory() as session:
         row = session.get(RegModel, reg["id"])
         assert row.payment is not None
-        uploads_dir = client.app.state.uploads_dir
-        files_on_disk = {p.name for p in uploads_dir.iterdir()} if uploads_dir.exists() else set()
-        referenced = {p.screenshot_path for p in session.query(PaymentModel).all()}
-        assert files_on_disk == referenced  # no orphaned files, no dangling references
+        proofs = session.query(ProofModel).filter_by(payment_id=row.payment.id).all()
+        assert len(proofs) == 1  # no duplicate proof rows from the race
+        proofs_dir = client.app.state.uploads_dir / "proofs"
+        files_on_disk = {p.name for p in proofs_dir.iterdir()} if proofs_dir.exists() else set()
+        assert files_on_disk == {proofs[0].storage_key}  # no orphaned files, no dangling references
 
 
 def test_app_startup_fails_loudly_on_ambiguous_ownership_backfill(tmp_path: Path):
@@ -960,9 +1008,15 @@ def test_audit_log_records_organizer_actor_for_event_and_payment_actions(client:
     client.post(f"/api/admin/payments/{payment_id}/confirm", headers=headers)
     with client.app.state.session_factory() as session:
         created = session.query(AuditLog).filter_by(event_type="EVENT_CREATED").order_by(AuditLog.id.desc()).first()
-        verified = session.query(AuditLog).filter_by(event_type="PAYMENT_VERIFIED").one()
+        # PAYMENT_VERIFIED is recorded twice on purpose — once against the
+        # registration (it moved to CONFIRMED) and once against the payment
+        # itself (see review_payment / transition_payment) — disambiguated by
+        # entity_type.
+        verified_registration = session.query(AuditLog).filter_by(event_type="PAYMENT_VERIFIED", entity_type="registration").one()
+        verified_payment = session.query(AuditLog).filter_by(event_type="PAYMENT_VERIFIED", entity_type="payment").one()
         assert created.actor_type == "ORGANIZER" and created.actor_id is not None
-        assert verified.actor_type == "ORGANIZER" and verified.actor_id is not None
+        assert verified_registration.actor_type == "ORGANIZER" and verified_registration.actor_id is not None
+        assert verified_payment.actor_type == "ORGANIZER" and verified_payment.actor_id is not None
 
 
 # --- Player profile -----------------------------------------------------------
@@ -979,3 +1033,184 @@ def test_player_can_view_and_update_own_profile(client: TestClient):
 
 def test_profile_requires_authentication(client: TestClient):
     assert client.get("/api/player/profile").status_code == 401
+
+
+# --- Payment configuration / snapshot integrity (Phase 2C) -------------------
+
+def test_payment_configuration_change_does_not_rewrite_existing_payment_snapshot(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9879000001")
+    registration = register(client, event["public_id"], player_headers).json()
+    assert registration["payment"]["amount_due"] == 350
+    assert registration["payment"]["payee_upi_id_snapshot"] == "strangerclub@upi"
+
+    updated = client.patch(
+        f"/api/admin/events/{event['id']}/payment-configuration", headers=headers,
+        json={"payee_upi_id": "newhandle@upi", "payee_name": "New Payee"},
+    )
+    assert updated.status_code == 200, updated.json()
+    assert updated.json()["payee_upi_id"] == "newhandle@upi"
+
+    # The event's live configuration changed, but this player's own Payment
+    # record — created before the change — must keep showing what applied
+    # when they registered, not the new configuration.
+    unchanged = client.get(f"/api/registrations/{registration['public_id']}", headers=player_headers).json()
+    assert unchanged["payment"]["payee_upi_id_snapshot"] == "strangerclub@upi"
+    assert "strangerclub%40upi" in unchanged["payment"]["upi_uri"]  # URL-encoded '@' — still the old, snapshotted handle
+    assert "newhandle" not in unchanged["payment"]["upi_uri"]
+
+    # A player registering AFTER the change gets the new configuration.
+    other_headers = player_login(client, "9879000002")
+    later = register(client, event["public_id"], other_headers).json()
+    assert later["payment"]["payee_upi_id_snapshot"] == "newhandle@upi"
+    assert later["payment"]["payee_name_snapshot"] == "New Payee"
+
+
+def test_payment_configuration_update_requires_event_ownership(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    other_client, other_headers = create_second_organizer(client)
+    response = other_client.patch(
+        f"/api/admin/events/{event['id']}/payment-configuration", headers=other_headers, json={"payee_upi_id": "hijack@upi"},
+    )
+    assert response.status_code == 404
+
+
+def test_payment_configuration_rejects_malformed_upi_id(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    response = client.patch(f"/api/admin/events/{event['id']}/payment-configuration", headers=headers, json={"payee_upi_id": "not-a-upi-id"})
+    assert response.status_code == 422
+
+
+def test_custom_qr_upload_and_retrieval_is_owner_scoped(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    qr_bytes = image_file()["screenshot"][1]
+    uploaded = client.post(
+        f"/api/admin/events/{event['id']}/payment-configuration/qr", headers=headers,
+        files={"qr_image": ("qr.png", qr_bytes, "image/png")},
+    )
+    assert uploaded.status_code == 200, uploaded.json()
+    assert uploaded.json()["qr_source"] == "UPLOADED"
+    assert uploaded.json()["has_custom_qr"] is True
+
+    player_headers = player_login(client, "9879000003")
+    registration = register(client, event["public_id"], player_headers).json()
+    assert registration["payment"]["qr_source_snapshot"] == "UPLOADED"
+    qr_url = registration["payment"]["qr_image_url"]
+    assert qr_url is not None
+
+    # Only the owning, authenticated player can fetch it.
+    fresh_client = TestClient(client.app)
+    assert fresh_client.get(qr_url).status_code == 401
+
+    other_client = TestClient(client.app)
+    other_headers = player_login(other_client, "9879000004")
+    other_registration = register(other_client, event["public_id"], other_headers).json()
+    assert other_client.get(other_registration["payment"]["qr_image_url"], headers=other_headers).status_code == 200
+    # Cross-player access to someone else's payment-qr URL is refused.
+    assert other_client.get(qr_url, headers=other_headers).status_code == 404
+    # The original owner (untouched session) can still fetch their own.
+    assert client.get(qr_url, headers=player_headers).status_code == 200
+
+
+def test_qr_upload_requires_event_ownership(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    other_client, other_headers = create_second_organizer(client)
+    response = other_client.post(
+        f"/api/admin/events/{event['id']}/payment-configuration/qr", headers=other_headers,
+        files={"qr_image": ("qr.png", image_file()["screenshot"][1], "image/png")},
+    )
+    assert response.status_code == 404
+
+
+def test_cancellation_never_rewrites_a_verified_payment(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9879100001")
+    reg = register(client, event["public_id"], player_headers).json(); submit_payment(client, reg, player_headers)
+    payment_id = client.get("/api/admin/payments/pending", headers=headers).json()[0]["payment"]["id"]
+    client.post(f"/api/admin/payments/{payment_id}/confirm", headers=headers)
+
+    cancelled = client.post(f"/api/admin/registrations/{reg['id']}/cancel", headers=headers)
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "CANCELLED"
+    assert cancelled.json()["payment"]["status"] == "VERIFIED"  # untouched — no refund state invented
+
+    with client.app.state.session_factory() as session:
+        from backend.app.models import Payment as PaymentModel, PaymentProof as ProofModel
+        payment = session.get(PaymentModel, payment_id)
+        assert payment.status == "VERIFIED"
+        proofs = session.query(ProofModel).filter_by(payment_id=payment_id).all()
+        assert len(proofs) == 1 and proofs[0].status == "ACCEPTED"
+
+
+def test_duplicate_screenshot_across_registrations_is_flagged_not_blocked(client: TestClient):
+    headers = login(client); event = new_event(client, headers, capacity=10)
+    a_headers = player_login(client, "9879200001")
+    a = register(client, event["public_id"], a_headers).json()
+    assert submit_payment(client, a, a_headers).status_code == 200
+
+    b_client = TestClient(client.app)
+    b_headers = player_login(b_client, "9879200002")
+    b = register(b_client, event["public_id"], b_headers).json()
+    # Same screenshot bytes as A's submission, from a different player/registration.
+    second = b_client.post(f"/api/registrations/{b['public_id']}/payment", files=image_file(), headers=b_headers)
+    assert second.status_code == 200  # never automatically blocked — only flagged for the organizer
+
+    pending = client.get("/api/admin/payments/pending", headers=headers).json()
+    by_reg = {row["id"]: row for row in pending}
+    b_payment = by_reg[b["id"]]["payment"]
+    assert b_payment["duplicate_of"], "organizer should see a duplicate warning for B's proof"
+    assert b_payment["duplicate_of"][0]["registration_id"] == a["id"]
+
+
+def test_concurrent_review_of_the_same_payment_only_one_succeeds(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9879300001")
+    reg = register(client, event["public_id"], player_headers).json()
+    submit_payment(client, reg, player_headers)
+    payment_id = client.get("/api/admin/payments/pending", headers=headers).json()[0]["payment"]["id"]
+    org_cookie = client.cookies.get("sc_organizer_session")
+
+    def do_confirm(_):
+        thread_client = TestClient(client.app)
+        thread_client.cookies.set("sc_organizer_session", org_cookie)
+        return thread_client.post(f"/api/admin/payments/{payment_id}/confirm", headers=headers).status_code
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(do_confirm, range(4)))
+
+    assert results.count(200) == 1
+    assert results.count(409) == 3
+    with client.app.state.session_factory() as session:
+        from backend.app.models import PaymentProof as ProofModel
+        accepted = session.query(ProofModel).filter_by(payment_id=payment_id, status="ACCEPTED").all()
+        assert len(accepted) == 1  # exactly one proof accepted, never double-reviewed
+
+
+def test_utr_is_validated_and_stored_on_the_proof_not_logged_in_full(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9879400001")
+    reg = register(client, event["public_id"], player_headers).json()
+
+    bad = client.post(f"/api/registrations/{reg['public_id']}/payment", files=image_file(), data={"utr": "!!!"}, headers=player_headers)
+    assert bad.status_code == 422
+
+    good = client.post(f"/api/registrations/{reg['public_id']}/payment", files=image_file(), data={"utr": "ABC123456789"}, headers=player_headers)
+    assert good.status_code == 200
+    assert good.json()["payment"]["utr_reference"] == "ABC123456789"
+
+    with client.app.state.session_factory() as session:
+        from backend.app.models import AuditLog
+        submitted = session.query(AuditLog).filter_by(event_type="PAYMENT_PROOF_SUBMITTED").order_by(AuditLog.id.desc()).first()
+        blob = str(submitted.metadata_json) + str(submitted.before_json) + str(submitted.after_json)
+        assert "ABC123456789" not in blob
+
+
+def test_player_payment_response_never_exposes_organizer_only_fields(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9879500001")
+    reg = register(client, event["public_id"], player_headers).json(); submit_payment(client, reg, player_headers)
+    status = client.get(f"/api/registrations/{reg['public_id']}", headers=player_headers).json()
+    assert status["payment"]["screenshot_url"] is None
+    assert status["payment"]["pending_proof_id"] is None
+    assert status["payment"]["proof_count"] is None
+    assert status["payment"]["duplicate_of"] is None

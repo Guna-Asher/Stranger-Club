@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import date as date_type, datetime, time
 from typing import Literal
 
@@ -7,6 +8,15 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 Position = Literal["BATSMAN", "BOWLER", "ALL_ROUNDER", "WICKET_KEEPER", "NO_PREFERENCE"]
 EventStatus = Literal["DRAFT", "OPEN", "FULL", "ONGOING", "COMPLETED", "CANCELLED"]
+
+UPI_ID_PATTERN = re.compile(r"^[a-zA-Z0-9.\-]{2,256}@[a-zA-Z][a-zA-Z]{1,64}$")
+
+
+def normalize_upi_id(value: str) -> str:
+    value = value.strip()
+    if not UPI_ID_PATTERN.match(value):
+        raise ValueError("Enter a valid UPI ID, e.g. name@bank")
+    return value
 
 
 def normalize_phone(value: str) -> str:
@@ -28,15 +38,27 @@ class MatchCreate(BaseModel):
     fee: int = Field(ge=1, le=100_000)
     registration_deadline: datetime
     upi_id: str = Field(min_length=3, max_length=120)
+    payee_name: str = Field(default="Stranger Club", min_length=1, max_length=80)
     status: EventStatus = "OPEN"
 
-    @field_validator("name", "venue", "upi_id")
+    @field_validator("name", "venue")
     @classmethod
     def trim_required_text(cls, value: str) -> str:
         value = value.strip()
         if not value:
             raise ValueError("This field cannot be blank")
         return value
+
+    @field_validator("upi_id")
+    @classmethod
+    def valid_upi(cls, value: str) -> str:
+        return normalize_upi_id(value)
+
+    @field_validator("payee_name")
+    @classmethod
+    def trim_payee_name(cls, value: str) -> str:
+        value = value.strip()
+        return value or "Stranger Club"
 
     @field_validator("end_time")
     @classmethod
@@ -55,8 +77,39 @@ class EventUpdate(BaseModel):
     capacity: int | None = Field(default=None, ge=2, le=200)
     fee: int | None = Field(default=None, ge=1, le=100_000)
     registration_deadline: datetime | None = None
-    upi_id: str | None = Field(default=None, min_length=3, max_length=120)
     status: EventStatus | None = None
+
+
+class PaymentConfigurationUpdate(BaseModel):
+    """Editing an event's live payment configuration. Never touches any
+    existing Payment record — those keep the snapshot they were created
+    with. qr_source may only be set to GENERATED here (reverting a custom
+    QR); setting UPLOADED happens only via the QR upload endpoint, which is
+    the only path that actually has image bytes to store."""
+    payee_upi_id: str | None = Field(default=None, min_length=3, max_length=120)
+    payee_name: str | None = Field(default=None, min_length=1, max_length=80)
+    qr_source: Literal["GENERATED"] | None = None
+
+    @field_validator("payee_upi_id")
+    @classmethod
+    def valid_upi(cls, value: str) -> str:
+        return normalize_upi_id(value)
+
+    @field_validator("payee_name")
+    @classmethod
+    def trim_payee_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("This field cannot be blank")
+        return value
+
+
+class PaymentConfigurationResponse(BaseModel):
+    payee_upi_id: str
+    payee_name: str
+    qr_source: str
+    has_custom_qr: bool
+    updated_at: datetime
 
 
 class RegistrationCreate(BaseModel):
@@ -177,7 +230,7 @@ class MatchResponse(BaseModel):
     capacity: int
     fee: int
     registration_deadline: datetime
-    upi_id: str
+    payment_configuration: PaymentConfigurationResponse
     status: str
     confirmed_count: int = 0
     pending_count: int = 0
@@ -187,14 +240,32 @@ class MatchResponse(BaseModel):
     collected_amount: int = 0
 
 
+class DuplicateProofRef(BaseModel):
+    proof_id: int
+    registration_id: int
+    player_name: str
+
+
 class PaymentResponse(BaseModel):
     id: int
-    amount: int
     status: str
-    submitted_at: datetime
+    amount_due: int
+    payee_upi_id_snapshot: str
+    payee_name_snapshot: str
+    qr_source_snapshot: str
+    upi_uri: str
+    qr_image_url: str | None = None
+    submitted_at: datetime | None = None
     verified_at: datetime | None = None
     rejection_reason: str | None = None
+    utr_reference: str | None = None
+    # Organizer-review-only fields. Always None/omitted for the player-facing
+    # view — see services.payment_to_response(viewer=...). Never leak these
+    # (or the underlying screenshot) to a player who isn't the reviewer.
     screenshot_url: str | None = None
+    pending_proof_id: int | None = None
+    proof_count: int | None = None
+    duplicate_of: list[DuplicateProofRef] | None = None
 
 
 class RegistrationResponse(BaseModel):
