@@ -185,9 +185,7 @@ async def store_payment_proof(upload: UploadFile, uploads_dir: Path) -> tuple[st
 
 
 async def submit_payment(session: Session, registration_key: str, upload: UploadFile, uploads_dir: Path) -> Registration:
-    condition = Registration.public_id == registration_key
-    if registration_key.isdigit(): condition = Registration.id == int(registration_key)  # temporary legacy route compatibility
-    registration = session.scalar(select(Registration).options(joinedload(Registration.match), joinedload(Registration.payment)).where(condition))
+    registration = session.scalar(select(Registration).options(joinedload(Registration.match), joinedload(Registration.payment)).where(Registration.public_id == registration_key))
     if not registration: raise api_error(404, "RESOURCE_NOT_FOUND", "Registration not found")
     if registration.status == WAITLISTED: raise api_error(409, "EVENT_FULL", "This registration is on the waitlist")
     if registration.status == CONFIRMED: raise api_error(409, "PAYMENT_ALREADY_VERIFIED", "This registration is already confirmed")

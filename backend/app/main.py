@@ -34,6 +34,10 @@ logger = logging.getLogger("stranger_club")
 SESSION_COOKIE = "sc_organizer_session"
 SESSION_HOURS = int(os.getenv("SC_SESSION_HOURS", "12"))
 PASSWORD_HASHER = PasswordHasher()
+REGISTRATION_RATE_LIMIT = 20
+REGISTRATION_RATE_WINDOW_SECONDS = 3600
+PAYMENT_UPLOAD_RATE_LIMIT = 20
+PAYMENT_UPLOAD_RATE_WINDOW_SECONDS = 3600
 
 
 class EventBroadcaster:
@@ -55,24 +59,39 @@ class EventBroadcaster:
 def token_hash(raw: str) -> str: return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def enforce_rate_limit(buckets: dict[str, list[float]], client: str, limit: int, window_seconds: int) -> None:
+    """Small in-memory sliding-window limiter shared by public, unauthenticated endpoints."""
+    attempts = [value for value in buckets.get(client, []) if time.time() - value < window_seconds]
+    if len(attempts) >= limit:
+        raise api_error(429, "RATE_LIMITED", "Too many requests. Please try again later.")
+    attempts.append(time.time())
+    buckets[client] = attempts
+
+
 def create_app(data_dir: Path | None = None, frontend_dir: Path | None = None, admin_username: str | None = None, admin_password: str | None = None) -> FastAPI:
     data_dir = data_dir or Path(os.getenv("SC_DATA_DIR", "data")); uploads_dir = data_dir / "uploads"
     session_factory = make_session_factory(data_dir / "stranger_club.db")
     username = admin_username or os.getenv("SC_ADMIN_USERNAME", "organizer")
-    password = admin_password or os.getenv("SC_ADMIN_PASSWORD") or ("stranger-club-dev" if os.getenv("SC_ENV", "development") != "production" else "")
+    password = admin_password or os.getenv("SC_ADMIN_PASSWORD")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         with session_factory() as session:
             seed_database(session)
-            if password and not session.scalar(select(Organizer).where(Organizer.username == username)):
+            if not session.scalar(select(Organizer).where(Organizer.username == username)):
+                if not password:
+                    raise RuntimeError(
+                        "No organizer account exists and SC_ADMIN_PASSWORD is not set. "
+                        "Set SC_ADMIN_PASSWORD (and optionally SC_ADMIN_USERNAME) before starting the app."
+                    )
                 session.add(Organizer(username=username, password_hash=PASSWORD_HASHER.hash(password)))
                 session.commit()
-                if not os.getenv("SC_ADMIN_PASSWORD"): logger.warning("development organizer created; set SC_ADMIN_PASSWORD before production")
+                logger.info("organizer_created username=%s", username)
         yield
 
     app = FastAPI(title="Stranger Club API", version="2.0.0", lifespan=lifespan)
     app.state.session_factory = session_factory; app.state.uploads_dir = uploads_dir; app.state.broadcaster = EventBroadcaster(); app.state.login_attempts: dict[str, list[float]] = {}
+    app.state.registration_attempts: dict[str, list[float]] = {}; app.state.payment_upload_attempts: dict[str, list[float]] = {}
 
     def get_session(request: Request):
         with request.app.state.session_factory() as session: yield session
@@ -178,17 +197,20 @@ def create_app(data_dir: Path | None = None, frontend_dir: Path | None = None, a
     @app.post("/api/events/{public_id}/registrations", response_model=RegistrationResponse, status_code=201)
     @app.post("/api/matches/{public_id}/registrations", response_model=RegistrationResponse, status_code=201)
     def register(public_id: str, payload: RegistrationCreate, request: Request, session: Session = Depends(get_session)):
+        client = request.client.host if request.client else "unknown"
+        enforce_rate_limit(request.app.state.registration_attempts, client, REGISTRATION_RATE_LIMIT, REGISTRATION_RATE_WINDOW_SECONDS)
         registration = create_registration(session, get_public_match(session, public_id), payload); publish(session, registration.match_id, "REGISTRATION_CREATED"); return registration_to_response(registration)
 
     @app.get("/api/registrations/{registration_key}", response_model=RegistrationResponse)
     def registration_status(registration_key: str, session: Session = Depends(get_session)):
-        condition = Registration.public_id == registration_key if not registration_key.isdigit() else Registration.id == int(registration_key)
-        registration = session.scalar(select(Registration).options(joinedload(Registration.payment)).where(condition))
+        registration = session.scalar(select(Registration).options(joinedload(Registration.payment)).where(Registration.public_id == registration_key))
         if not registration: raise api_error(404, "RESOURCE_NOT_FOUND", "Registration not found")
         return registration_to_response(registration)
 
     @app.post("/api/registrations/{registration_key}/payment", response_model=RegistrationResponse)
     async def upload_payment(request: Request, registration_key: str, screenshot: UploadFile = File(...), session: Session = Depends(get_session)):
+        client = request.client.host if request.client else "unknown"
+        enforce_rate_limit(request.app.state.payment_upload_attempts, client, PAYMENT_UPLOAD_RATE_LIMIT, PAYMENT_UPLOAD_RATE_WINDOW_SECONDS)
         registration = await submit_payment(session, registration_key, screenshot, request.app.state.uploads_dir); publish(session, registration.match_id, "PAYMENT_SUBMITTED"); return registration_to_response(registration)
 
     @app.get("/api/admin/events", response_model=list[MatchResponse])

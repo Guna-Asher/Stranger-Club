@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 from sqlalchemy import text
 
-from backend.app.main import create_app
+from backend.app.main import PAYMENT_UPLOAD_RATE_LIMIT, REGISTRATION_RATE_LIMIT, create_app
 from backend.app.models import OrganizerSession, now_ist
 from backend.app.services import verify_payment
 
@@ -81,7 +81,9 @@ def test_legacy_database_is_upgraded_without_losing_event_or_payment(tmp_path: P
         """)
     with TestClient(create_app(data_dir=data_dir, admin_password="correct-horse")) as legacy_client:
         event = legacy_client.get("/api/events/legacy-event").json()
-        registration = legacy_client.get("/api/registrations/1").json()
+        with legacy_client.app.state.session_factory() as session:
+            public_id = session.execute(text("SELECT public_id FROM registrations WHERE id = 1")).scalar_one()
+        registration = legacy_client.get(f"/api/registrations/{public_id}").json()
         assert event["status"] == "OPEN"
         assert event["payment_submitted_count"] == 1
         assert registration["status"] == "PENDING"
@@ -204,3 +206,30 @@ def test_admin_proof_is_not_public(client: TestClient):
     proof = client.get("/api/admin/payments/pending").json()[0]["payment"]["screenshot_url"]
     client.post("/api/auth/logout", headers=headers)
     assert client.get(proof).status_code == 401
+
+
+def test_numeric_registration_id_no_longer_resolves(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    registration = register(client, event["public_id"]).json()
+    assert client.get(f"/api/registrations/{registration['id']}").status_code == 404
+    numeric_lookup = submit_payment(client, {"public_id": str(registration["id"])})
+    assert numeric_lookup.status_code == 404
+
+
+def test_registration_rate_limit(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    for _ in range(REGISTRATION_RATE_LIMIT):
+        register(client, event["public_id"], "9100000002")
+    limited = register(client, event["public_id"], "9100000002")
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "RATE_LIMITED"
+
+
+def test_payment_upload_rate_limit(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    registration = register(client, event["public_id"], "9100000003").json()
+    for _ in range(PAYMENT_UPLOAD_RATE_LIMIT):
+        submit_payment(client, registration)
+    limited = submit_payment(client, registration)
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "RATE_LIMITED"
