@@ -113,6 +113,28 @@ class PlayerAuthResponse(BaseModel):
     csrf_token: str
 
 
+class PlayerProfileUpdate(BaseModel):
+    display_name: str | None = Field(default=None, max_length=120)
+    cricket_role: Position | None = None
+    skill_rating: int | None = Field(default=None, ge=1, le=10)
+    bio: str | None = Field(default=None, max_length=500)
+
+    @field_validator("display_name", "bio", mode="before")
+    @classmethod
+    def blank_is_none(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+
+class PlayerProfileResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    display_name: str | None = None
+    cricket_role: str = "NO_PREFERENCE"
+    skill_rating: int | None = None
+    bio: str | None = None
+
+
 class RejectRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=500)
 

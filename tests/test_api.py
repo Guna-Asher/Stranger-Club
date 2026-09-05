@@ -47,6 +47,26 @@ def player_login(client: TestClient, phone: str = "9876543210") -> dict[str, str
     return {"X-CSRF-Token": verified.json()["csrf_token"]}
 
 
+def create_second_organizer(client: TestClient, username: str = "second_organizer", password: str = "correct-horse-2") -> dict[str, str]:
+    from argon2 import PasswordHasher
+    from backend.app.models import Organizer
+    with client.app.state.session_factory() as session:
+        session.add(Organizer(username=username, password_hash=PasswordHasher().hash(password)))
+        session.commit()
+    other_client = TestClient(client.app)
+    response = other_client.post("/api/auth/login", json={"username": username, "password": password})
+    assert response.status_code == 200, response.json()
+    return other_client, {"X-CSRF-Token": response.json()["csrf_token"]}
+
+
+def make_platform_admin(client: TestClient, username: str = "organizer") -> None:
+    from backend.app.models import Organizer
+    with client.app.state.session_factory() as session:
+        organizer = session.query(Organizer).filter_by(username=username).one()
+        organizer.role = "PLATFORM_ADMIN"
+        session.commit()
+
+
 def new_event(client: TestClient, headers: dict[str, str], *, capacity: int = 4, name: str = "Friday Cricket") -> dict:
     response = client.post("/api/admin/events", headers=headers, json={
         "name": name, "date": "2026-10-02", "start_time": "07:00:00", "end_time": "10:00:00",
@@ -106,6 +126,10 @@ def test_legacy_database_is_upgraded_without_losing_event_or_payment(tmp_path: P
             public_id = row.public_id
             assert row.status == "PENDING"
             assert row.user_id is None  # migrated row: no authenticated owner
+            from backend.app.models import Match, Organizer
+            match = session.get(Match, 1)
+            organizer = session.query(Organizer).one()
+            assert match.owner_organizer_id == organizer.id  # unambiguous backfill (exactly one organizer)
 
         # No session at all: the old "public_id is enough" path must be gone.
         assert legacy_client.get(f"/api/registrations/{public_id}").status_code == 401
@@ -115,6 +139,11 @@ def test_legacy_database_is_upgraded_without_losing_event_or_payment(tmp_path: P
         headers = player_login(legacy_client, "9000000001")
         cross = legacy_client.get(f"/api/registrations/{public_id}", headers=headers)
         assert cross.status_code == 404
+
+        # The organizer created by this app's own bootstrap CAN manage the
+        # backfilled legacy event, since ownership resolved unambiguously.
+        org_headers = login(legacy_client)
+        assert legacy_client.get("/api/admin/events/1", headers=org_headers).status_code == 200
 
 
 def test_authentication_csrf_logout_and_expiration(client: TestClient):
@@ -258,7 +287,7 @@ def test_concurrent_payment_confirmation_cannot_exceed_capacity(client: TestClie
 
     def confirm(payment_id: int):
         with client.app.state.session_factory() as session:
-            return verify_payment(session, payment_id, approve=True).status
+            return verify_payment(session, payment_id, approve=True, actor_id=1).status
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(confirm, pending_ids))
@@ -486,3 +515,467 @@ def test_organizer_flow_is_unaffected_by_player_authentication(client: TestClien
     assert confirmed.status_code == 200
     assert confirmed.json()["status"] == "CONFIRMED"
     assert client.get("/api/auth/me").json()["organizer"] == {"username": "organizer", "role": "ORGANIZER"}
+
+
+# --- Cancellation ------------------------------------------------------------
+
+def test_player_can_cancel_own_pending_registration(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9878100001")
+    reg = register(client, event["public_id"], player_headers).json()
+    response = client.post(f"/api/registrations/{reg['public_id']}/cancel", headers=player_headers)
+    assert response.status_code == 200
+    assert response.json()["status"] == "CANCELLED"
+
+
+def test_player_can_cancel_own_confirmed_registration_and_frees_capacity(client: TestClient):
+    headers = login(client); event = new_event(client, headers, capacity=2)
+    p1_headers = player_login(client, "9878100002")
+    reg1 = register(client, event["public_id"], p1_headers).json(); submit_payment(client, reg1, p1_headers)
+    payment_id_1 = client.get("/api/admin/payments/pending", headers=headers).json()[0]["payment"]["id"]
+    client.post(f"/api/admin/payments/{payment_id_1}/confirm", headers=headers)
+
+    p2_client = TestClient(client.app)
+    p2_headers = player_login(p2_client, "9878100022")
+    reg2 = register(p2_client, event["public_id"], p2_headers).json(); submit_payment(p2_client, reg2, p2_headers)
+    payment_id_2 = client.get("/api/admin/payments/pending", headers=headers).json()[0]["payment"]["id"]
+    client.post(f"/api/admin/payments/{payment_id_2}/confirm", headers=headers)
+
+    summary_before = client.get(f"/api/events/{event['public_id']}/summary").json()
+    assert summary_before["confirmed"] == 2 and summary_before["available"] == 0
+    assert client.get(f"/api/events/{event['public_id']}").json()["status"] == "FULL"
+
+    response = client.post(f"/api/registrations/{reg1['public_id']}/cancel", headers=p1_headers)
+    assert response.status_code == 200
+
+    summary_after = client.get(f"/api/events/{event['public_id']}/summary").json()
+    assert summary_after["confirmed"] == 1 and summary_after["available"] == 1
+    assert client.get(f"/api/events/{event['public_id']}").json()["status"] == "OPEN"
+
+
+def test_player_cannot_cancel_another_players_registration(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    owner_headers = player_login(client, "9878100003")
+    reg = register(client, event["public_id"], owner_headers).json()
+    other_client = TestClient(client.app)
+    other_headers = player_login(other_client, "9878100004")
+    response = other_client.post(f"/api/registrations/{reg['public_id']}/cancel", headers=other_headers)
+    assert response.status_code == 404
+
+
+def test_cancelling_already_cancelled_registration_is_idempotent(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9878100005")
+    reg = register(client, event["public_id"], player_headers).json()
+    first = client.post(f"/api/registrations/{reg['public_id']}/cancel", headers=player_headers)
+    second = client.post(f"/api/registrations/{reg['public_id']}/cancel", headers=player_headers)
+    assert first.status_code == second.status_code == 200
+    assert first.json()["status"] == second.json()["status"] == "CANCELLED"
+
+
+def test_organizer_can_cancel_registration_on_own_event(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9878100006")
+    reg = register(client, event["public_id"], player_headers).json()
+    response = client.post(f"/api/admin/registrations/{reg['id']}/cancel", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["status"] == "CANCELLED"
+
+
+def test_rejected_registration_cannot_be_cancelled(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9878000001")
+    reg = register(client, event["public_id"], player_headers).json(); submit_payment(client, reg, player_headers)
+    payment_id = client.get("/api/admin/payments/pending", headers=headers).json()[0]["payment"]["id"]
+    client.post(f"/api/admin/payments/{payment_id}/reject", headers=headers, json={"reason": "bad proof"})
+    response = client.post(f"/api/registrations/{reg['public_id']}/cancel", headers=player_headers)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "INVALID_STATE_TRANSITION"
+
+
+def test_cancellation_blocked_after_event_has_started(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9878000002")
+    reg = register(client, event["public_id"], player_headers).json()
+    assert client.patch(f"/api/admin/events/{event['id']}", headers=headers, json={"status": "ONGOING"}).status_code == 200
+    response = client.post(f"/api/registrations/{reg['public_id']}/cancel", headers=player_headers)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "EVENT_ALREADY_STARTED"
+
+
+# --- Re-registration after cancellation --------------------------------------
+
+def test_player_can_register_again_after_cancelling_as_a_new_record(client: TestClient):
+    from backend.app.models import Registration as RegModel
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9878200001")
+    first = register(client, event["public_id"], player_headers).json()
+    client.post(f"/api/registrations/{first['public_id']}/cancel", headers=player_headers)
+
+    second = register(client, event["public_id"], player_headers)
+    assert second.status_code == 201
+    second_data = second.json()
+    assert second_data["id"] != first["id"]
+    assert second_data["public_id"] != first["public_id"]
+    assert second_data["status"] == "PENDING"
+
+    with client.app.state.session_factory() as session:
+        original = session.get(RegModel, first["id"])
+        assert original.status == "CANCELLED"
+        assert original.public_id == first["public_id"]  # untouched, not reused
+
+
+def test_cancelled_registration_does_not_count_toward_capacity(client: TestClient):
+    headers = login(client); event = new_event(client, headers, capacity=2)
+    p1_headers = player_login(client, "9878200002")
+    reg1 = register(client, event["public_id"], p1_headers).json(); submit_payment(client, reg1, p1_headers)
+    payment_id_1 = client.get("/api/admin/payments/pending", headers=headers).json()[0]["payment"]["id"]
+    client.post(f"/api/admin/payments/{payment_id_1}/confirm", headers=headers)
+
+    p2_client = TestClient(client.app)
+    p2_headers = player_login(p2_client, "9878200023")
+    reg2 = register(p2_client, event["public_id"], p2_headers).json(); submit_payment(p2_client, reg2, p2_headers)
+    payment_id_2 = client.get("/api/admin/payments/pending", headers=headers).json()[0]["payment"]["id"]
+    client.post(f"/api/admin/payments/{payment_id_2}/confirm", headers=headers)
+    assert client.get(f"/api/events/{event['public_id']}").json()["status"] == "FULL"
+
+    # Cancel one of the two confirmed players, freeing exactly one slot.
+    client.post(f"/api/registrations/{reg1['public_id']}/cancel", headers=p1_headers)
+
+    other_client = TestClient(client.app)
+    other_headers = player_login(other_client, "9878200003")
+    third = register(other_client, event["public_id"], other_headers).json()
+    assert third["status"] == "PENDING"  # capacity available again, not waitlisted
+
+
+def test_still_only_one_active_registration_per_event_after_cancellation(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9878200004")
+    first = register(client, event["public_id"], player_headers).json()
+    client.post(f"/api/registrations/{first['public_id']}/cancel", headers=player_headers)
+    second = register(client, event["public_id"], player_headers)
+    assert second.status_code == 201
+    third = register(client, event["public_id"], player_headers)
+    assert third.status_code == 409
+    assert third.json()["error"]["code"] == "REGISTRATION_EXISTS"
+
+
+def test_database_rejects_duplicate_active_registration_bypassing_service_layer(client: TestClient):
+    import uuid as uuid_module
+    from sqlalchemy.exc import IntegrityError
+    from backend.app.models import Registration as RegModel
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9878300001")
+    reg = register(client, event["public_id"], player_headers).json()
+
+    with client.app.state.session_factory() as session:
+        existing = session.get(RegModel, reg["id"])
+        duplicate = RegModel(
+            public_id=uuid_module.uuid4().hex, match_id=existing.match_id, user_id=existing.user_id,
+            name="Bypass Attempt", phone=existing.phone, status="PENDING", preferred_position="NO_PREFERENCE",
+        )
+        session.add(duplicate)
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+
+# --- Organizer ownership / RBAC ----------------------------------------------
+
+def test_organizer_cannot_access_another_organizers_event(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    other_client, other_headers = create_second_organizer(client)
+    assert other_client.get(f"/api/admin/events/{event['id']}", headers=other_headers).status_code == 404
+    assert other_client.patch(f"/api/admin/events/{event['id']}", headers=other_headers, json={"status": "FULL"}).status_code == 404
+    assert other_client.get(f"/api/admin/events/{event['id']}/summary", headers=other_headers).status_code == 404
+    assert other_client.get(f"/api/admin/events/{event['id']}/registrations", headers=other_headers).status_code == 404
+
+
+def test_organizer_cannot_review_payments_on_another_organizers_event(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9877600001")
+    reg = register(client, event["public_id"], player_headers).json(); submit_payment(client, reg, player_headers)
+    payment_id = client.get("/api/admin/payments/pending", headers=headers).json()[0]["payment"]["id"]
+    proof_url = client.get("/api/admin/payments/pending", headers=headers).json()[0]["payment"]["screenshot_url"]
+
+    other_client, other_headers = create_second_organizer(client)
+    assert other_client.post(f"/api/admin/payments/{payment_id}/confirm", headers=other_headers).status_code == 404
+    assert other_client.post(f"/api/admin/payments/{payment_id}/reject", headers=other_headers, json={"reason": "not yours"}).status_code == 404
+    assert other_client.get(proof_url, headers=other_headers).status_code == 404
+    # the rightful organizer still can
+    assert client.post(f"/api/admin/payments/{payment_id}/confirm", headers=headers).status_code == 200
+
+
+def test_organizer_cannot_promote_or_cancel_on_another_organizers_event(client: TestClient):
+    headers = login(client); event = new_event(client, headers, capacity=2)
+    p1 = player_login(client, "9877700001"); reg1 = register(client, event["public_id"], p1).json()
+    submit_payment(client, reg1, p1)
+    pay_id_1 = client.get("/api/admin/payments/pending", headers=headers).json()[0]["payment"]["id"]
+    client.post(f"/api/admin/payments/{pay_id_1}/confirm", headers=headers)
+
+    p2_client = TestClient(client.app)
+    p2 = player_login(p2_client, "9877700002"); reg2 = register(p2_client, event["public_id"], p2).json()
+    submit_payment(p2_client, reg2, p2)
+    pay_id_2 = client.get("/api/admin/payments/pending", headers=headers).json()[0]["payment"]["id"]
+    client.post(f"/api/admin/payments/{pay_id_2}/confirm", headers=headers)
+
+    p3_client = TestClient(client.app)
+    p3 = player_login(p3_client, "9877700003"); reg3 = register(p3_client, event["public_id"], p3).json()
+    assert reg3["status"] == "WAITLISTED"
+
+    other_client, other_headers = create_second_organizer(client)
+    assert other_client.post(f"/api/admin/registrations/{reg3['id']}/promote", headers=other_headers).status_code == 404
+    assert other_client.post(f"/api/admin/registrations/{reg1['id']}/cancel", headers=other_headers).status_code == 404
+
+
+def test_admin_events_list_is_filtered_by_ownership(client: TestClient):
+    headers = login(client); mine = new_event(client, headers, name="Mine")
+    other_client, other_headers = create_second_organizer(client)
+    theirs_response = other_client.post("/api/admin/events", headers=other_headers, json={
+        "name": "Theirs", "date": "2026-10-05", "start_time": "07:00:00", "end_time": "10:00:00",
+        "venue": "Other Ground", "capacity": 4, "fee": 100,
+        "registration_deadline": "2026-10-04T20:00:00", "upi_id": "other@upi",
+    })
+    assert theirs_response.status_code == 201
+    theirs = theirs_response.json()
+
+    mine_ids = {item["id"] for item in client.get("/api/admin/events", headers=headers).json()}
+    theirs_ids = {item["id"] for item in other_client.get("/api/admin/events", headers=other_headers).json()}
+    assert mine["id"] in mine_ids and theirs["id"] not in mine_ids
+    assert theirs["id"] in theirs_ids and mine["id"] not in theirs_ids
+
+
+def test_platform_admin_can_access_any_organizers_event(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    other_client, other_headers = create_second_organizer(client)
+    make_platform_admin(other_client, "second_organizer")
+    assert other_client.get(f"/api/admin/events/{event['id']}", headers=other_headers).status_code == 200
+
+
+# --- Concurrency / production failure cases ----------------------------------
+
+def test_cancel_and_promote_race_never_exceeds_capacity(client: TestClient):
+    headers = login(client); event = new_event(client, headers, capacity=2)
+    a_headers = player_login(client, "9877000001")
+    a = register(client, event["public_id"], a_headers).json(); submit_payment(client, a, a_headers)
+    a_payment_id = client.get("/api/admin/payments/pending", headers=headers).json()[0]["payment"]["id"]
+    client.post(f"/api/admin/payments/{a_payment_id}/confirm", headers=headers)
+
+    a2_client = TestClient(client.app)
+    a2_headers = player_login(a2_client, "9877000003")
+    a2 = register(a2_client, event["public_id"], a2_headers).json(); submit_payment(a2_client, a2, a2_headers)
+    a2_payment_id = client.get("/api/admin/payments/pending", headers=headers).json()[0]["payment"]["id"]
+    client.post(f"/api/admin/payments/{a2_payment_id}/confirm", headers=headers)
+
+    b_client = TestClient(client.app)
+    b_headers = player_login(b_client, "9877000002")
+    b = register(b_client, event["public_id"], b_headers).json()
+    assert b["status"] == "WAITLISTED"
+
+    a_cookie = client.cookies.get("sc_player_session")
+    org_cookie = client.cookies.get("sc_organizer_session")
+
+    def do_cancel():
+        thread_client = TestClient(client.app)
+        thread_client.cookies.set("sc_player_session", a_cookie)
+        return thread_client.post(f"/api/registrations/{a['public_id']}/cancel", headers=a_headers).status_code
+
+    def do_promote():
+        thread_client = TestClient(client.app)
+        thread_client.cookies.set("sc_organizer_session", org_cookie)
+        return thread_client.post(f"/api/admin/registrations/{b['id']}/promote", headers=headers).status_code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        cancel_future = pool.submit(do_cancel)
+        promote_future = pool.submit(do_promote)
+        cancel_status = cancel_future.result()
+        promote_status = promote_future.result()
+
+    assert cancel_status == 200
+    assert promote_status in (200, 409)
+    if promote_status == 409:
+        assert client.post(f"/api/admin/registrations/{b['id']}/promote", headers=headers).status_code == 200
+
+    # Promotion moves WAITLISTED -> PENDING (payment still owed), not straight
+    # to CONFIRMED — so the invariant here is "A2 stays confirmed, B is no
+    # longer waitlisted, and capacity (confirmed count) was never exceeded."
+    summary = client.get(f"/api/events/{event['public_id']}/summary").json()
+    assert summary["confirmed"] == 1 and summary["waitlisted"] == 0 and summary["pending"] == 1
+
+
+def test_concurrent_confirmation_after_cancellation_frees_slot(client: TestClient):
+    headers = login(client); event = new_event(client, headers, capacity=2)
+    a_headers = player_login(client, "9877100001")
+    a = register(client, event["public_id"], a_headers).json(); submit_payment(client, a, a_headers)
+    a_payment_id = client.get("/api/admin/payments/pending", headers=headers).json()[0]["payment"]["id"]
+    client.post(f"/api/admin/payments/{a_payment_id}/confirm", headers=headers)
+
+    a2_client = TestClient(client.app)
+    a2_headers = player_login(a2_client, "9877100004")
+    a2 = register(a2_client, event["public_id"], a2_headers).json(); submit_payment(a2_client, a2, a2_headers)
+    a2_payment_id = client.get("/api/admin/payments/pending", headers=headers).json()[0]["payment"]["id"]
+    client.post(f"/api/admin/payments/{a2_payment_id}/confirm", headers=headers)
+    assert client.get(f"/api/events/{event['public_id']}").json()["status"] == "FULL"
+
+    # A cancels, freeing exactly one of the two slots (A2 remains confirmed).
+    client.post(f"/api/registrations/{a['public_id']}/cancel", headers=a_headers)
+
+    for phone in ("9877100002", "9877100003"):
+        p_client = TestClient(client.app)
+        p_headers = player_login(p_client, phone)
+        reg = register(p_client, event["public_id"], p_headers).json()
+        submit_payment(p_client, reg, p_headers)
+    payment_ids = [row["payment"]["id"] for row in client.get("/api/admin/payments/pending", headers=headers).json()]
+    assert len(payment_ids) == 2
+
+    def confirm(payment_id: int):
+        with client.app.state.session_factory() as session:
+            return verify_payment(session, payment_id, approve=True, actor_id=1).status
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(confirm, payment_ids))
+
+    summary = client.get(f"/api/events/{event['public_id']}/summary").json()
+    assert sorted(results) == ["CONFIRMED", "WAITLISTED"]
+    assert summary["confirmed"] == 2  # A2 (already confirmed) + exactly one of the two new competitors
+
+
+def test_concurrent_duplicate_cancellation_requests_are_safe(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9877200001")
+    reg = register(client, event["public_id"], player_headers).json()
+    cookie = client.cookies.get("sc_player_session")
+
+    def do_cancel(_):
+        thread_client = TestClient(client.app)
+        thread_client.cookies.set("sc_player_session", cookie)
+        return thread_client.post(f"/api/registrations/{reg['public_id']}/cancel", headers=player_headers).status_code
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(do_cancel, range(4)))
+    assert all(status == 200 for status in results)
+
+
+def test_concurrent_reregistration_after_cancellation_only_one_wins(client: TestClient):
+    headers = login(client); event = new_event(client, headers)
+    phone = "9877300001"
+    player_headers = player_login(client, phone)
+    first = register(client, event["public_id"], player_headers).json()
+    client.post(f"/api/registrations/{first['public_id']}/cancel", headers=player_headers)
+    cookie = client.cookies.get("sc_player_session")
+
+    def do_register(_):
+        thread_client = TestClient(client.app)
+        thread_client.cookies.set("sc_player_session", cookie)
+        return thread_client.post(f"/api/events/{event['public_id']}/registrations", json={"name": "Race Player", "preferred_position": "NO_PREFERENCE"}, headers=player_headers).status_code
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(do_register, range(4)))
+
+    assert results.count(201) == 1
+    assert results.count(409) == 3
+
+    with client.app.state.session_factory() as session:
+        count = session.execute(
+            text("SELECT COUNT(*) FROM registrations WHERE match_id = :mid AND status != 'CANCELLED'"), {"mid": event["id"]},
+        ).scalar_one()
+        assert count == 1
+
+
+def test_concurrent_payment_submission_has_no_race_or_orphaned_files(client: TestClient):
+    from backend.app.models import Payment as PaymentModel, Registration as RegModel
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9877400001")
+    reg = register(client, event["public_id"], player_headers).json()
+    cookie = client.cookies.get("sc_player_session")
+
+    def do_submit(_):
+        thread_client = TestClient(client.app)
+        thread_client.cookies.set("sc_player_session", cookie)
+        return thread_client.post(f"/api/registrations/{reg['public_id']}/payment", files=image_file(), headers=player_headers).status_code
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(do_submit, range(6)))
+
+    assert results.count(200) == 1
+    assert results.count(409) == 5
+
+    with client.app.state.session_factory() as session:
+        row = session.get(RegModel, reg["id"])
+        assert row.payment is not None
+        uploads_dir = client.app.state.uploads_dir
+        files_on_disk = {p.name for p in uploads_dir.iterdir()} if uploads_dir.exists() else set()
+        referenced = {p.screenshot_path for p in session.query(PaymentModel).all()}
+        assert files_on_disk == referenced  # no orphaned files, no dangling references
+
+
+def test_app_startup_fails_loudly_on_ambiguous_ownership_backfill(tmp_path: Path):
+    data_dir = tmp_path / "ambiguous"; data_dir.mkdir(); database = data_dir / "stranger_club.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript("""
+            CREATE TABLE matches (id INTEGER PRIMARY KEY, public_id VARCHAR(64) UNIQUE, name VARCHAR(120), date DATE,
+                start_time TIME, end_time TIME, venue VARCHAR(200), capacity INTEGER, fee INTEGER,
+                registration_deadline DATETIME, upi_id VARCHAR(120), qr_code_path VARCHAR(255), status VARCHAR(32),
+                created_at DATETIME, updated_at DATETIME);
+            CREATE TABLE registrations (id INTEGER PRIMARY KEY, match_id INTEGER, name VARCHAR(120), phone VARCHAR(16),
+                email VARCHAR(254), status VARCHAR(32), created_at DATETIME, updated_at DATETIME,
+                CONSTRAINT uq_registration_match_phone UNIQUE(match_id, phone));
+            CREATE TABLE payments (id INTEGER PRIMARY KEY, registration_id INTEGER UNIQUE, amount INTEGER,
+                screenshot_path VARCHAR(255), screenshot_token VARCHAR(64) UNIQUE, status VARCHAR(32), submitted_at DATETIME,
+                verified_at DATETIME, rejection_reason TEXT);
+            CREATE TABLE organizers (id INTEGER PRIMARY KEY, username VARCHAR(80) UNIQUE, password_hash VARCHAR(255),
+                role VARCHAR(32), is_active BOOLEAN, created_at DATETIME, updated_at DATETIME);
+            INSERT INTO matches VALUES (1, 'ambiguous-event', 'Ambiguous Cricket', '2026-10-02', '07:00:00', '10:00:00',
+                'Ground', 22, 300, '2026-10-01 20:00:00', 'x@upi', NULL, 'ACTIVE', '2026-08-01', '2026-08-01');
+            INSERT INTO organizers VALUES (1, 'existing_organizer', 'hash', 'ORGANIZER', 1, '2026-08-01', '2026-08-01');
+            INSERT INTO organizers VALUES (2, 'another_organizer', 'hash2', 'ORGANIZER', 1, '2026-08-01', '2026-08-01');
+        """)
+    with pytest.raises(RuntimeError, match="Cannot safely backfill"):
+        with TestClient(create_app(data_dir=data_dir, admin_username="existing_organizer", admin_password="correct-horse")):
+            pass
+
+
+# --- Audit attribution --------------------------------------------------------
+
+def test_audit_log_records_actor_for_registration_cancellation(client: TestClient):
+    from backend.app.models import AuditLog
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9877800001")
+    reg = register(client, event["public_id"], player_headers).json()
+    client.post(f"/api/registrations/{reg['public_id']}/cancel", headers=player_headers)
+    with client.app.state.session_factory() as session:
+        entry = session.query(AuditLog).filter_by(event_type="REGISTRATION_CANCELLED").one()
+        assert entry.actor_type == "PLAYER"
+        assert entry.actor_id is not None
+        assert entry.before_json == {"status": "PENDING"}
+        assert entry.after_json == {"status": "CANCELLED"}
+
+
+def test_audit_log_records_organizer_actor_for_event_and_payment_actions(client: TestClient):
+    from backend.app.models import AuditLog
+    headers = login(client); event = new_event(client, headers)
+    player_headers = player_login(client, "9877800002")
+    reg = register(client, event["public_id"], player_headers).json(); submit_payment(client, reg, player_headers)
+    payment_id = client.get("/api/admin/payments/pending", headers=headers).json()[0]["payment"]["id"]
+    client.post(f"/api/admin/payments/{payment_id}/confirm", headers=headers)
+    with client.app.state.session_factory() as session:
+        created = session.query(AuditLog).filter_by(event_type="EVENT_CREATED").order_by(AuditLog.id.desc()).first()
+        verified = session.query(AuditLog).filter_by(event_type="PAYMENT_VERIFIED").one()
+        assert created.actor_type == "ORGANIZER" and created.actor_id is not None
+        assert verified.actor_type == "ORGANIZER" and verified.actor_id is not None
+
+
+# --- Player profile -----------------------------------------------------------
+
+def test_player_can_view_and_update_own_profile(client: TestClient):
+    player_headers = player_login(client, "9877900001")
+    profile = client.get("/api/player/profile", headers=player_headers)
+    assert profile.status_code == 200
+    assert profile.json() == {"display_name": None, "cricket_role": "NO_PREFERENCE", "skill_rating": None, "bio": None}
+    updated = client.patch("/api/player/profile", headers=player_headers, json={"display_name": "Test Player", "cricket_role": "BOWLER", "skill_rating": 7})
+    assert updated.status_code == 200
+    assert updated.json() == {"display_name": "Test Player", "cricket_role": "BOWLER", "skill_rating": 7, "bio": None}
+
+
+def test_profile_requires_authentication(client: TestClient):
+    assert client.get("/api/player/profile").status_code == 401

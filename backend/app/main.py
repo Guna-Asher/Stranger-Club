@@ -17,7 +17,7 @@ from .models import Match, Organizer
 from .otp.base import OtpProvider
 from .otp.console import ConsoleOtpProvider
 from .routers import admin, auth, events, payments, player_auth, registrations
-from .services import api_error, seed_database
+from .services import api_error, backfill_missing_event_ownership, seed_database
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("stranger_club")
@@ -32,16 +32,25 @@ def create_app(data_dir: Path | None = None, frontend_dir: Path | None = None, a
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         with session_factory() as session:
-            seed_database(session)
-            if not session.scalar(select(Organizer).where(Organizer.username == username)):
+            organizer = session.scalar(select(Organizer).where(Organizer.username == username))
+            if not organizer:
                 if not password:
                     raise RuntimeError(
                         "No organizer account exists and SC_ADMIN_PASSWORD is not set. "
                         "Set SC_ADMIN_PASSWORD (and optionally SC_ADMIN_USERNAME) before starting the app."
                     )
-                session.add(Organizer(username=username, password_hash=PASSWORD_HASHER.hash(password)))
+                organizer = Organizer(username=username, password_hash=PASSWORD_HASHER.hash(password))
+                session.add(organizer)
                 session.commit()
                 logger.info("organizer_created username=%s", username)
+            # The organizer must exist before seeding, so the seed event has a
+            # real owner from the moment it's created.
+            seed_database(session, owner_organizer_id=organizer.id)
+            # Backfill any pre-existing event that predates ownership
+            # tracking. Deliberately runs here (after the organizer above is
+            # guaranteed to exist), not in the Alembic migration, which runs
+            # earlier and may see zero organizers on a fresh/legacy database.
+            backfill_missing_event_ownership(session)
         yield
 
     app = FastAPI(title="Stranger Club API", version="2.0.0", lifespan=lifespan)

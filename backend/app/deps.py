@@ -11,8 +11,10 @@ from fastapi import Depends, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
-from .models import Match, Organizer, OrganizerSession, PlayerSession, User, now_ist
+from .models import Match, Organizer, OrganizerSession, Payment, PlayerSession, Registration, User, now_ist
 from .services import api_error, event_summary
+
+PLATFORM_ADMIN = "PLATFORM_ADMIN"
 
 SESSION_COOKIE = "sc_organizer_session"
 SESSION_HOURS = int(os.getenv("SC_SESSION_HOURS", "12"))
@@ -82,6 +84,44 @@ def require_csrf(request: Request, context: tuple[Organizer, OrganizerSession] =
     if not secrets.compare_digest(request.headers.get("X-CSRF-Token", ""), context[1].csrf_token):
         raise api_error(403, "CSRF_INVALID", "Security token is invalid or expired")
     return context[0]
+
+
+def organizer_owns_event(organizer: Organizer, match: Match) -> bool:
+    return organizer.role == PLATFORM_ADMIN or match.owner_organizer_id == organizer.id
+
+
+def organizer_events_filter(organizer: Organizer):
+    """SQLAlchemy WHERE clause for list endpoints: PLATFORM_ADMIN sees every
+    event, a regular organizer sees only events they own. One shared helper
+    so the two admin list endpoints (events, pending payments) can't drift."""
+    if organizer.role == PLATFORM_ADMIN:
+        return True
+    return Match.owner_organizer_id == organizer.id
+
+
+def require_event_access(match_id: int, organizer: Organizer = Depends(require_admin), session: Session = Depends(get_session)) -> Match:
+    """Loads a Match by its internal id, enforcing organizer ownership (or
+    PLATFORM_ADMIN). 404, not 403, on a mismatch — the existing player
+    ownership pattern, applied here too: a non-owning organizer must not be
+    able to tell "wrong owner" apart from "doesn't exist"."""
+    match = session.get(Match, match_id)
+    if not match or not organizer_owns_event(organizer, match):
+        raise api_error(404, "EVENT_NOT_FOUND", "Event not found")
+    return match
+
+
+def require_payment_access(payment_id: int, organizer: Organizer = Depends(require_admin), session: Session = Depends(get_session)) -> Payment:
+    payment = session.scalar(select(Payment).options(joinedload(Payment.registration).joinedload(Registration.match)).where(Payment.id == payment_id))
+    if not payment or not organizer_owns_event(organizer, payment.registration.match):
+        raise api_error(404, "RESOURCE_NOT_FOUND", "Payment not found")
+    return payment
+
+
+def require_registration_access(registration_id: int, organizer: Organizer = Depends(require_admin), session: Session = Depends(get_session)) -> Registration:
+    registration = session.scalar(select(Registration).options(joinedload(Registration.match)).where(Registration.id == registration_id))
+    if not registration or not organizer_owns_event(organizer, registration.match):
+        raise api_error(404, "RESOURCE_NOT_FOUND", "Registration not found")
+    return registration
 
 
 def publish_event_update(request: Request, session: Session, match_id: int, kind: str) -> None:

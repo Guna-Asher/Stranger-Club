@@ -10,7 +10,7 @@ from ..deps import (
 )
 from ..models import Registration, User
 from ..schemas import RegistrationCreate, RegistrationResponse
-from ..services import api_error, assert_registration_owner, create_registration, get_public_match, registration_to_response
+from ..services import api_error, assert_registration_owner, cancel_registration, create_registration, get_public_match, registration_to_response
 
 router = APIRouter()
 
@@ -29,3 +29,13 @@ def registration_status(registration_key: str, session: Session = Depends(get_se
     if not registration: raise api_error(404, "RESOURCE_NOT_FOUND", "Registration not found")
     assert_registration_owner(registration, player.id)
     return registration_to_response(registration)
+
+
+@router.post("/api/registrations/{registration_key}/cancel", response_model=RegistrationResponse)
+def cancel_own_registration(registration_key: str, request: Request, session: Session = Depends(get_session), player: User = Depends(require_player_csrf)):
+    registration = session.scalar(select(Registration).where(Registration.public_id == registration_key))
+    if not registration: raise api_error(404, "RESOURCE_NOT_FOUND", "Registration not found")
+    assert_registration_owner(registration, player.id)
+    updated = cancel_registration(session, registration.id, actor_type="PLAYER", actor_id=player.id)
+    publish_event_update(request, session, updated.match_id, "REGISTRATION_CANCELLED")
+    return registration_to_response(updated)

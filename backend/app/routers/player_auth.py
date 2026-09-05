@@ -9,14 +9,16 @@ from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from sqlalchemy import select
+
 from ..deps import (
     OTP_REQUEST_IP_LIMIT, OTP_REQUEST_IP_WINDOW_SECONDS, OTP_REQUEST_PHONE_LIMIT,
     OTP_REQUEST_PHONE_WINDOW_SECONDS, OTP_VERIFY_IP_LIMIT, OTP_VERIFY_IP_WINDOW_SECONDS,
     PLAYER_SESSION_COOKIE, PLAYER_SESSION_DAYS, enforce_rate_limit, get_session,
-    player_auth_context, require_player_csrf, token_hash,
+    player_auth_context, require_player, require_player_csrf, token_hash,
 )
-from ..models import PlayerSession, User, now_ist
-from ..schemas import OtpRequest, OtpVerify, PlayerAuthResponse
+from ..models import PlayerProfile, PlayerSession, User, now_ist
+from ..schemas import OtpRequest, OtpVerify, PlayerAuthResponse, PlayerProfileResponse, PlayerProfileUpdate
 from ..services_player import request_otp, verify_otp
 
 logger = logging.getLogger("stranger_club")
@@ -67,3 +69,18 @@ def me(context: tuple[User, PlayerSession] = Depends(player_auth_context)):
 @router.post("/api/player/logout", status_code=204)
 def logout(response: Response, _: User = Depends(require_player_csrf), context: tuple[User, PlayerSession] = Depends(player_auth_context), session: Session = Depends(get_session)):
     session.delete(context[1]); session.commit(); response.delete_cookie(PLAYER_SESSION_COOKIE, path="/")
+
+
+@router.get("/api/player/profile", response_model=PlayerProfileResponse)
+def get_profile(player: User = Depends(require_player), session: Session = Depends(get_session)):
+    profile = session.scalar(select(PlayerProfile).where(PlayerProfile.user_id == player.id))
+    return profile
+
+
+@router.patch("/api/player/profile", response_model=PlayerProfileResponse)
+def update_profile(payload: PlayerProfileUpdate, player: User = Depends(require_player_csrf), session: Session = Depends(get_session)):
+    profile = session.scalar(select(PlayerProfile).where(PlayerProfile.user_id == player.id))
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(profile, field, value)
+    session.commit(); session.refresh(profile)
+    return profile

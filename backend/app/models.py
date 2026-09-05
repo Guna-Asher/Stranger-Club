@@ -3,8 +3,20 @@ from __future__ import annotations
 from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, JSON, String, Text, Time, UniqueConstraint
+from sqlalchemy import (
+    Boolean, CheckConstraint, Date, DateTime, ForeignKey, Index, Integer, JSON, String, Text, Time, text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+# Registration statuses considered "active" for the purposes of the one-active-
+# registration-per-user-per-event invariant. REJECTED is deliberately included:
+# the product lets a rejected player resubmit payment proof on the SAME
+# registration (see services.submit_payment / Pay.jsx "UPLOAD NEW PROOF"), so a
+# rejected registration must keep occupying its uniqueness slot rather than
+# allowing a second, parallel registration to be created alongside it.
+# CANCELLED is the only terminal, non-blocking status.
+ACTIVE_REGISTRATION_STATUSES = ("PENDING", "WAITLISTED", "CONFIRMED", "REJECTED")
+ALL_REGISTRATION_STATUSES = ACTIVE_REGISTRATION_STATUSES + ("CANCELLED",)
 
 
 class Base(DeclarativeBase):
@@ -18,6 +30,10 @@ def now_ist() -> datetime:
 
 class Match(Base):
     __tablename__ = "matches"
+    __table_args__ = (
+        CheckConstraint("capacity >= 2", name="ck_match_capacity_positive"),
+        CheckConstraint("fee >= 1", name="ck_match_fee_nonnegative"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     public_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
@@ -32,6 +48,10 @@ class Match(Base):
     upi_id: Mapped[str] = mapped_column(String(120))
     qr_code_path: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="ACTIVE")
+    # The organizer who owns this event. NULL only for rows that predate event
+    # ownership; backfilled where unambiguous during the Phase 2B migration
+    # (see alembic/versions/0002_...). Every new event sets this server-side.
+    owner_organizer_id: Mapped[int | None] = mapped_column(ForeignKey("organizers.id"), index=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist, onupdate=now_ist)
 
@@ -39,6 +59,17 @@ class Match(Base):
 
 
 class Player(Base):
+    """LEGACY, FROZEN. Superseded by User + PlayerProfile (Phase 2A/2B).
+
+    No application code reads or writes this table anymore as of Phase 2B.
+    The class/columns are kept declared only so that:
+      (a) this table and registrations.player_id continue to exist for any
+          database upgrading from a pre-Alembic legacy shape (the frozen
+          migrations in migrations.py still reference them), and
+      (b) SQLAlchemy's create_all() keeps producing a schema-compatible
+          "no such table" is never raised for very old databases.
+    Do not add new usage of this model. Do not dual-write to it.
+    """
     __tablename__ = "players"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -49,16 +80,32 @@ class Player(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist, onupdate=now_ist)
 
-    registrations: Mapped[list[Registration]] = relationship(back_populates="player")
-
 
 class Registration(Base):
     __tablename__ = "registrations"
-    __table_args__ = (UniqueConstraint("match_id", "phone", name="uq_registration_match_phone"),)
+    __table_args__ = (
+        CheckConstraint(f"status IN {ALL_REGISTRATION_STATUSES}", name="ck_registration_status_valid"),
+        # One ACTIVE registration per (event, authenticated user). CANCELLED
+        # rows are excluded from this index entirely, so a player can cancel
+        # and register again as a brand-new, independent historical record —
+        # never by reactivating or overwriting the cancelled one. Rows with
+        # user_id IS NULL (pre-authentication legacy data) are also excluded:
+        # they were never subject to this invariant and must not be
+        # retroactively constrained by it.
+        Index(
+            "uq_registration_active_per_user",
+            "match_id", "user_id",
+            unique=True,
+            sqlite_where=text(f"status IN {ACTIVE_REGISTRATION_STATUSES} AND user_id IS NOT NULL"),
+            postgresql_where=text(f"status IN {ACTIVE_REGISTRATION_STATUSES} AND user_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     public_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     match_id: Mapped[int] = mapped_column(ForeignKey("matches.id"), index=True)
+    # LEGACY, unused — see Player docstring. Never written to by application
+    # code as of Phase 2B; retained only for schema compatibility.
     player_id: Mapped[int | None] = mapped_column(ForeignKey("players.id"), index=True, nullable=True)
     # The authenticated owner of this registration. NULL only for rows created
     # before player authentication existed; such rows are intentionally not
@@ -71,11 +118,11 @@ class Registration(Base):
     status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True)
     preferred_position: Mapped[str] = mapped_column(String(32), default="NO_PREFERENCE")
     assigned_position: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist, onupdate=now_ist)
 
     match: Mapped[Match] = relationship(back_populates="registrations")
-    player: Mapped[Player | None] = relationship(back_populates="registrations")
     user: Mapped[User | None] = relationship()
     payment: Mapped[Payment | None] = relationship(back_populates="registration", uselist=False, cascade="all, delete-orphan")
 
@@ -130,6 +177,12 @@ class AuditLog(Base):
     entity_type: Mapped[str] = mapped_column(String(80))
     entity_id: Mapped[str] = mapped_column(String(80))
     metadata_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Attribution, added in Phase 2B. Nullable because historical rows (and a
+    # small number of system-initiated events) may not have an actor.
+    actor_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    actor_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    before_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    after_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
 
 
