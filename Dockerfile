@@ -15,6 +15,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY backend ./backend
+COPY alembic.ini ./
+COPY alembic ./alembic
 COPY --from=frontend /app/dist ./frontend_dist
 RUN mkdir -p /data/uploads
 EXPOSE 8000
