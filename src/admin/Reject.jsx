@@ -1,0 +1,3 @@
+import { LoaderCircle, X } from 'lucide-react';
+
+export default function Reject({ reason, setReason, close, submit, busy }) { return <div className="overlay"><section className="sheet reject"><button className="close" onClick={close}><X /></button><p className="eyebrow">REJECT PAYMENT</p><h2>WHAT NEEDS FIXING?</h2><p className="quiet">This note is shown to the player so they can submit a new proof.</p><textarea value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. The transaction reference is not visible." autoFocus /><button className="primary-button" disabled={busy || reason.trim().length < 3} onClick={submit}>{busy ? <LoaderCircle className="spin" /> : 'REJECT PAYMENT'}</button></section></div>; }

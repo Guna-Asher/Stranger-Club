@@ -1,0 +1,1 @@
+export default function Field({ label, value, set, ...input }) { return <label className="field"><span>{label}</span><input value={value} onChange={(e) => set(e.target.value)} {...input} /></label>; }

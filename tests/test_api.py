@@ -10,7 +10,8 @@ from fastapi.testclient import TestClient
 from PIL import Image
 from sqlalchemy import text
 
-from backend.app.main import PAYMENT_UPLOAD_RATE_LIMIT, REGISTRATION_RATE_LIMIT, create_app
+from backend.app.deps import PAYMENT_UPLOAD_RATE_LIMIT, REGISTRATION_RATE_LIMIT
+from backend.app.main import create_app
 from backend.app.models import OrganizerSession, now_ist
 from backend.app.services import verify_payment
 
