@@ -1,5 +1,49 @@
 # Deployment
 
+## Local vs. production
+
+This repository has two entirely separate ways of running, and they never
+depend on each other:
+
+| | Local (`docker compose up --build`) | Production |
+|---|---|---|
+| Orchestration | `docker-compose.yml` (repository root) | Your chosen platform (e.g. Render, as a Docker Web Service) |
+| Database | `postgres` container (`postgres:16-alpine`), ephemeral local volume | A real managed PostgreSQL provider |
+| Object storage | `minio` container (local S3-compatible) | A real S3-compatible provider — Cloudflare R2 recommended |
+| Application image | Built by Compose from the same `Dockerfile` | The same `Dockerfile`, built by your platform or pushed to its registry |
+| Migration | One-shot `migrate` Compose service runs `python -m backend.app.migrate` before `app` starts | An explicit `python -m backend.app.migrate` run as a pre-deploy/release step (below), never left to `SC_AUTO_MIGRATE` |
+| `SC_ENV` | `development` | `production` |
+
+The application itself has no idea which one it's running under —
+`DATABASE_URL` and `SC_STORAGE_*` always just point at *something* that
+speaks PostgreSQL/S3, whether that's `postgres`/`minio` (Compose's service
+names) or a real provider's hostname. No file in `backend/app/` branches on
+Compose or on any specific hosting platform. See `docs/runbook.md` §2 for
+the full local Compose walkthrough (start/stop/reset/tests/troubleshooting)
+— this document covers production only from here down.
+
+**No real production deployment (Render or otherwise) has actually been
+created from this repository or this environment.** Everything below is
+the intended, documented pattern — verified where the verification note
+says so, and explicitly flagged where it still requires a real provider
+account to confirm end-to-end.
+
+### Render, specifically
+
+If Render is the chosen platform: create a **Docker Web Service** pointed
+at this repository. Render builds `Dockerfile` itself — no registry push
+needed, no Render-specific file in the repository (no `render.yaml` is
+required or assumed here). Attach a Render managed PostgreSQL instance and
+set `DATABASE_URL` to its connection string; set the `SC_STORAGE_*`
+variables to a real R2/S3 bucket's credentials (not MinIO — MinIO is
+Compose/local-only and must never be used in production). Configure
+`SC_AUTO_MIGRATE=false` and run `python -m backend.app.migrate` as an
+explicit pre-deploy step (Render's "Pre-Deploy Command", or an equivalent
+manual/CI step) before traffic reaches the new instance — see "Migration
+as a release step" below. Nothing here is Render-specific in the
+application itself; the same pattern applies to any Docker-hosting
+platform.
+
 ## Environment variables
 
 ### Required in staging/production
@@ -44,6 +88,13 @@ protected, but an explicit step is simpler to reason about and to gate a
 deploy pipeline on than "whichever instance boots first").
 
 ## Docker
+
+**This section is about production.** For local development, use
+`docker compose up --build` (`docker-compose.yml`, repository root — see
+`docs/runbook.md` §2) instead of the commands below — Compose is local-only
+and is never part of a production deployment. What follows is the
+production shape: the same `Dockerfile`, run directly against real
+infrastructure instead of Compose's `postgres`/`minio` containers.
 
 ```bash
 docker build -t stranger-club .

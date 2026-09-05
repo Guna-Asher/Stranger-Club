@@ -1,0 +1,120 @@
+# Local-only development stack: `docker compose up --build`.
+#
+# This file exists to make local setup a single command. It has no bearing
+# on production: the same image built here (`Dockerfile`, unmodified) is
+# what gets deployed as a Render Docker Web Service (or any other Docker
+# host) — against a real managed PostgreSQL and a real S3-compatible
+# provider (Cloudflare R2 recommended), never against these containers.
+# PostgreSQL and S3-compatible storage are external services from the
+# application's point of view in both places; only their *address* differs
+# (`postgres`/`minio` service names here, real provider hostnames in
+# production). See docs/runbook.md and docs/deployment.md for the full
+# local-vs-production picture.
+#
+# Local-only credentials throughout this file (`${...:-default}` values) —
+# never reused in any real deployment. Override any of them by creating a
+# `.env` file (see `.env.example`); none is required to just run `up`.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-stranger_club}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-development-only}
+      POSTGRES_DB: ${POSTGRES_DB:-stranger_club}
+    volumes:
+      - stranger_club_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-stranger_club} -d ${POSTGRES_DB:-stranger_club}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-local_storage_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-local_storage_admin_password}
+    volumes:
+      - stranger_club_minio_data:/data
+    ports:
+      - "${MINIO_API_HOST_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+    healthcheck:
+      # The actual endpoint MinIO documents for this purpose — not /health,
+      # which this image doesn't serve.
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: creates the application's bucket, then exits. Uses the
+  # official image's own bundled `mc` client — no custom script or extra
+  # image needed. `--ignore-existing` is what makes a second `up` a clean
+  # no-op instead of a failure.
+  minio-init:
+    image: minio/minio
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set local http://minio:9000 "${MINIO_ROOT_USER:-local_storage_admin}" "${MINIO_ROOT_PASSWORD:-local_storage_admin_password}" &&
+        mc mb --ignore-existing "local/${SC_STORAGE_BUCKET:-stranger-club-local}" &&
+        echo "bucket ${SC_STORAGE_BUCKET:-stranger-club-local} ready"
+    restart: "no"
+
+  # One-shot: applies every Alembic migration, then exits — the repository's
+  # existing release-step command (backend/app/migrate.py), unchanged.
+  # Runs before `app` so the schema is never a race: exactly one thing ever
+  # owns migration, never every app replica deciding for itself.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: stranger-club:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["python", "-m", "backend.app.migrate"]
+    environment:
+      SC_ENV: development
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-stranger_club}:${POSTGRES_PASSWORD:-local-development-only}@postgres:5432/${POSTGRES_DB:-stranger_club}
+      SC_AUTO_MIGRATE: "false"
+    restart: "no"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: stranger-club:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "${APP_HOST_PORT:-8000}:8000"
+    environment:
+      SC_ENV: development
+      # Service names, never localhost/127.0.0.1 — the app reaches these
+      # containers over the Compose-managed network, not the host loopback.
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-stranger_club}:${POSTGRES_PASSWORD:-local-development-only}@postgres:5432/${POSTGRES_DB:-stranger_club}
+      SC_AUTO_MIGRATE: "false"
+      SC_ADMIN_USERNAME: ${SC_ADMIN_USERNAME:-organizer}
+      SC_ADMIN_PASSWORD: ${SC_ADMIN_PASSWORD:-local-development-only}
+      SC_STORAGE_BACKEND: s3
+      SC_STORAGE_BUCKET: ${SC_STORAGE_BUCKET:-stranger-club-local}
+      SC_STORAGE_ENDPOINT_URL: http://minio:9000
+      SC_STORAGE_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-local_storage_admin}
+      SC_STORAGE_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-local_storage_admin_password}
+
+volumes:
+  stranger_club_postgres_data:
+  stranger_club_minio_data:

@@ -188,31 +188,55 @@ package.json           Frontend dependencies and npm scripts
 | Tool | Required for | Verify with |
 |---|---|---|
 | Git | Everything | `git --version` |
-| Python 3.12 | Backend | `python3 --version` |
-| Node.js 22 | Frontend | `node --version` |
-| npm | Frontend | `npm --version` |
-| Docker | Local Postgres/MinIO containers, building the production image | `docker --version` |
-| `psql` (PostgreSQL client) | Inspecting a Postgres database directly, running the role-provisioning script | `psql --version` |
+| Docker (with Compose v2, i.e. Docker Desktop or an equivalent) | **The primary local workflow** — starts the app, PostgreSQL, and MinIO together | `docker --version`, `docker compose version` |
+| Python 3.12 | Only for native (non-Docker) backend development | `python3 --version` |
+| Node.js 22 | Only for native (non-Docker) frontend development | `node --version` |
+| npm | Only for native frontend development | `npm --version` |
+| `psql` (PostgreSQL client) | Optional — inspecting a Postgres database directly | `psql --version` |
 
-Docker is not strictly required to run the backend against SQLite, but it
-is the only supported way to run a local PostgreSQL/MinIO instance and to
-build/verify the production image. Full detail, exact commands, and
-what's optional vs. required in each environment: **[`docs/runbook.md`](docs/runbook.md)**.
+Full detail, exact commands, and what's optional vs. required in each
+environment: **[`docs/runbook.md`](docs/runbook.md)**.
 
 ## 9. Quick start
 
-The shortest path to a running app, using SQLite (no database server to
-install) and local filesystem storage (no object storage to configure).
-This is a **development-only** configuration — see [§16](#16-production-deployment-overview).
-
-From the repository root:
+**The primary, recommended way to run Stranger Club locally is Docker
+Compose — one command starts the app, PostgreSQL, and MinIO (a local
+S3-compatible store) together, pre-migrated and ready.**
 
 ```bash
 git clone https://github.com/Guna-Asher/Stranger-Club.git
 cd Stranger-Club
+docker compose up --build
 ```
 
-Backend — from the repository root:
+Then open:
+
+```
+http://localhost:8000
+```
+
+That's the whole setup — no Python, Node, or manual database/storage setup
+needed. It builds the same production-style image used for deployment
+(§14), starts PostgreSQL and MinIO, creates the MinIO bucket, runs every
+Alembic migration, and only then starts the application — using
+local-development-only credentials baked into `docker-compose.yml` (see
+[`docs/runbook.md`](docs/runbook.md#2-local-development-docker-compose-primary-workflow)
+for the full explanation, how to stop/reset it, and how to override the
+defaults via a `.env` file if you want to).
+
+The first organizer account is created automatically:
+`organizer` / `local-development-only` (see
+[`docs/runbook.md`](docs/runbook.md#2-local-development-docker-compose-primary-workflow)
+to change it).
+
+To stop everything: `docker compose down`. To wipe local data and start
+fresh: `docker compose down -v` — **destroys the local Postgres/MinIO data
+volumes**, never a production command.
+
+### Advanced: native development (no Docker)
+
+For editing backend/frontend code with hot reload outside a container —
+SQLite and local filesystem storage, zero external services:
 
 ```bash
 python3 -m venv .venv
@@ -221,32 +245,22 @@ SC_DATA_DIR=./data SC_ADMIN_PASSWORD='local-dev-password' \
   .venv/bin/uvicorn backend.app.main:app --reload --port 8000
 ```
 
-This creates `./data/stranger_club.db`, applies every migration
-automatically, seeds one demo event, and creates the first organizer
-account (`organizer` / `local-dev-password`).
-
-Frontend — in a **second terminal**, from the repository root:
+In a second terminal:
 
 ```bash
 npm install
 npm run dev
 ```
 
-Then open:
-
 | What | URL |
 |---|---|
-| Player app | `http://localhost:5173/` |
-| Organizer login | `http://localhost:5173/admin/login` |
-| Backend health | `http://localhost:8000/health` |
-| Backend readiness | `http://localhost:8000/ready` |
+| Player app (native dev server) | `http://localhost:5173/` |
+| Organizer login (native dev server) | `http://localhost:5173/admin/login` |
+| Backend directly | `http://localhost:8000/` |
 
-Log in to the organizer console with `organizer` / `local-dev-password`.
-
-For the full walkthrough (register a player, pay, verify, build teams,
-schedule and complete a match, record a result) and for running against
-real PostgreSQL/S3-compatible storage locally, see
-**[`docs/runbook.md`](docs/runbook.md)**.
+Full detail on both workflows, plus the complete end-to-end product
+walkthrough (register a player, pay, verify, build teams, schedule and
+complete a match, record a result): **[`docs/runbook.md`](docs/runbook.md)**.
 
 ## 10. Environment configuration
 
@@ -279,22 +293,32 @@ delete method — evidence is append-only. See
 
 ## 13. Running backend/frontend
 
-Two independent processes, always: the backend (`uvicorn`) and the frontend
-dev server (`vite`), each in its own terminal. Exact commands are in
-[§9](#9-quick-start) above and expanded in
+The primary path is `docker compose up --build` (§9) — one command, no
+separate terminals. The native/advanced path runs two independent
+processes, always: the backend (`uvicorn`) and the frontend dev server
+(`vite`), each in its own terminal — see §9's advanced section and
 [`docs/runbook.md`](docs/runbook.md#11-starting-the-application).
 
 ## 14. Docker
+
+`docker-compose.yml` (repository root) is the **local-only** development
+stack — `docker compose up --build` (§9) starts the app, PostgreSQL 16,
+and MinIO together, with automatic bucket creation and migrations before
+the app starts. It has no bearing on production.
+
+The underlying image is built the same way either locally or for
+deployment:
 
 ```bash
 docker build -t stranger-club .
 ```
 
-builds a multi-stage image (Node build stage → Python 3.12-slim runtime,
-non-root user, `HEALTHCHECK` against `/health`). There is no
-`docker-compose.yml` in this repository — local PostgreSQL/MinIO and the
-application container are each started with a plain `docker run`. Full
-sequence, environment variables, and read-only-filesystem verification:
+A multi-stage build (Node build stage → Python 3.12-slim runtime, non-root
+user, `HEALTHCHECK` against `/health`) — the **same image**, unmodified,
+that Compose builds locally is what gets deployed to a platform such as
+Render as a Docker Web Service, pointed at real managed PostgreSQL and
+real S3-compatible storage instead of the local containers. Full sequence,
+environment variables, and read-only-filesystem verification:
 [`docs/runbook.md`](docs/runbook.md#15-docker).
 
 ## 15. Testing

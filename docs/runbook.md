@@ -18,51 +18,281 @@ the *Event* (the cricket gathering itself), and the two needed different
 names. You will see `Fixture` in code, migrations, and internal comments;
 you will never see it in the UI.
 
-1. [Prerequisites](#2-prerequisites)
-2. [Clone and verify the repository](#3-clone-and-verify-repository)
-3. [Python environment](#4-python-environment)
-4. [Frontend environment](#5-frontend-environment)
-5. [Environment variables](#6-environment-variables)
-6. [Local database](#7-local-database)
-7. [Local PostgreSQL](#8-local-postgresql)
-8. [Local S3 / MinIO](#9-local-s3--minio)
-9. [Database migrations](#10-database-migrations)
-10. [Starting the application](#11-starting-the-application)
-11. [First admin/organizer setup](#12-first-adminorganizer-setup)
-12. [First end-to-end test](#13-first-end-to-end-test)
-13. [Testing](#14-testing)
-14. [Docker](#15-docker)
-15. [Production configuration](#16-production-configuration)
-16. [Production deployment order](#17-production-deployment-order)
-17. [Backups](#18-backups)
-18. [Restore / disaster recovery](#19-restore--disaster-recovery)
-19. [SQLite → PostgreSQL migration](#20-sqlite--postgresql-migration)
-20. [Routine operations](#21-routine-operations)
-21. [Troubleshooting](#22-troubleshooting)
-22. [Clean reset / local restart](#23-clean-reset--local-restart)
-23. [Security checklist](#24-security-checklist)
-24. [Release checklist](#25-release-checklist)
+1. **[Local development: Docker Compose (primary workflow)](#2-local-development-docker-compose-primary-workflow)**
+   — start here; this is the recommended way to run Stranger Club locally.
+2. [Prerequisites](#3-prerequisites)
+3. Advanced: native development (without Docker) — skip unless you're
+   editing backend/frontend code outside a container:
+   [Clone](#4-clone-and-verify-repository) ·
+   [Python environment](#5-python-environment) ·
+   [Frontend environment](#6-frontend-environment) ·
+   [Local database](#8-local-database) ·
+   [Local PostgreSQL](#9-local-postgresql) ·
+   [Local S3 / MinIO](#10-local-s3--minio)
+4. [Environment variables](#7-environment-variables)
+5. [Database migrations](#11-database-migrations)
+6. [Starting the application](#12-starting-the-application)
+7. [First admin/organizer setup](#13-first-adminorganizer-setup)
+8. [First end-to-end test](#14-first-end-to-end-test)
+9. [Testing](#15-testing)
+10. [Docker](#16-docker)
+11. [Production configuration](#17-production-configuration)
+12. [Production deployment order](#18-production-deployment-order)
+13. [Backups](#19-backups)
+14. [Restore / disaster recovery](#20-restore--disaster-recovery)
+15. [SQLite → PostgreSQL migration](#21-sqlite--postgresql-migration)
+16. [Routine operations](#22-routine-operations)
+17. [Troubleshooting](#23-troubleshooting)
+18. [Clean reset / local restart](#24-clean-reset--local-restart)
+19. [Security checklist](#25-security-checklist)
+20. [Release checklist](#26-release-checklist)
 
 ---
 
-## 2. Prerequisites
+## 2. Local development: Docker Compose (primary workflow)
+
+**This is the recommended way to run Stranger Club locally.** One command
+starts the application, PostgreSQL 16, and MinIO (a local S3-compatible
+store) together, fully migrated and ready.
+
+`docker-compose.yml` (repository root) is **local-only** — it has no
+bearing on, and is never used by, production. The same application image
+it builds (`Dockerfile`, unmodified) is exactly what gets deployed to a
+platform such as Render as a Docker Web Service — see
+[§11](#11-database-migrations) and [§17](#17-production-configuration) for
+how production differs (real managed PostgreSQL and a real S3-compatible
+provider instead of these containers; the application code never knows the
+difference, since PostgreSQL and object storage are both external services
+from its point of view in either place).
+
+### Requirements
+
+Only Docker (with Compose v2 — this ships with current Docker Desktop, or
+install the `docker compose` plugin separately on Linux):
+
+```bash
+docker --version
+docker compose version
+```
+
+### Start
+
+From the repository root:
+
+```bash
+git clone https://github.com/Guna-Asher/Stranger-Club.git
+cd Stranger-Club
+docker compose up --build
+```
+
+Then open:
+
+```
+http://localhost:8000
+```
+
+Log in to the organizer console (`http://localhost:8000/admin/login`) with
+`organizer` / `local-development-only` (overridable — see "Configuration"
+below).
+
+### What starts, and in what order
+
+```
+postgres  → healthy
+minio     → healthy
+                ├─ minio-init  → creates the "stranger-club-local" bucket, exits 0
+                └─ migrate     → runs every Alembic migration, exits 0
+                                        ↓
+                                       app → starts, becomes healthy
+```
+
+Five services, defined in `docker-compose.yml`:
+
+| Service | Image | Role |
+|---|---|---|
+| `postgres` | `postgres:16-alpine` | The database. Healthcheck: `pg_isready`. |
+| `minio` | `minio/minio` | Local S3-compatible object storage (payment-proof/QR images). Healthcheck: the real `/minio/health/live` endpoint. |
+| `minio-init` | `minio/minio` (same image, one-shot) | Creates the `stranger-club-local` bucket using the image's own bundled `mc` client, then exits. `mc mb --ignore-existing` — safe to run again on every `up`; a second run reports the same success message, not an error. |
+| `migrate` | This repository's own image (built from `Dockerfile`) | Runs `python -m backend.app.migrate` — the exact same release-step command §11 documents for production — then exits. `SC_AUTO_MIGRATE=false` on both `migrate` and `app`, so exactly one thing ever applies migrations, never every instance racing to do it itself. |
+| `app` | This repository's own image (same build as `migrate`) | The actual application — built React frontend + FastAPI backend, same image deployed to production. |
+
+`app` does not start until `postgres` reports healthy **and** both
+`migrate` and `minio-init` have exited successfully (`condition:
+service_completed_successfully` in `docker-compose.yml`) — not a bare
+`depends_on: service_started`, which would only guarantee the *containers*
+exist, not that the database is reachable or the bucket/schema are ready.
+
+### Where data lives
+
+Two named, Compose-managed volumes — durable across `stop`/`start` and
+plain `docker compose down`, erased only by `down -v`:
+
+| Volume | Contents |
+|---|---|
+| `stranger_club_postgres_data` | The PostgreSQL database |
+| `stranger_club_minio_data` | Every object in the `stranger-club-local` bucket (payment-proof screenshots, QR images) |
+
+The application container itself holds no durable state — consistent with
+production, where every instance is stateless.
+
+### Configuration
+
+`docker compose up --build` needs **no setup at all** — every credential
+has a local-development-only default baked into `docker-compose.yml`
+(`${VAR:-default}` syntax). To override any of them (e.g. to pick a
+different local admin password, or to move a port), copy `.env.example` to
+`.env` and edit it:
+
+```bash
+cp .env.example .env
+```
+
+Docker Compose reads `.env` automatically. **A real `.env` must never be
+committed** — it's already in `.gitignore`; `.env.example` (committed) is
+the documentation of what's overridable.
+
+### Commands
+
+```bash
+docker compose up --build       # start (foreground, logs streaming)
+docker compose up -d --build    # start (detached / background)
+docker compose ps               # status of every service
+docker compose logs -f app      # follow the application's logs
+docker compose logs -f postgres
+docker compose logs -f minio
+docker compose down             # stop — data volumes are kept
+docker compose down -v          # stop AND DELETE local Postgres/MinIO data
+```
+
+**`docker compose down -v` destroys the local PostgreSQL and MinIO data
+volumes.** This is a local development reset command, never something to
+run against a real deployment — there is no equivalent "production"
+version of this command; production data lives in your managed provider,
+entirely outside anything Compose touches.
+
+### Rebuilding after code changes
+
+`docker compose up --build` always rebuilds the image from the current
+source before starting — Docker's own layer cache makes this fast when
+only application code (not `requirements.lock.txt`/`package-lock.json`)
+changed. If you want to be certain of a fully fresh build:
+
+```bash
+docker compose build --no-cache
+docker compose up
+```
+
+### How migrations happen here
+
+The `migrate` service runs `python -m backend.app.migrate` — the
+repository's real, existing migration entry point, unchanged — against
+`postgres` once it's healthy, then exits. `app` waits for that exit to be
+successful before it ever starts. This is deliberately not `create_all()`
+and not each `app` replica deciding for itself whether to migrate (that's
+exactly the trap `SC_AUTO_MIGRATE=false` on the `app` service avoids). See
+[§11](#11-database-migrations) for what this command does in detail and
+how it differs from a bare `alembic` CLI invocation (which does not work
+standalone in this repository).
+
+### How the MinIO bucket gets created
+
+The `minio-init` service — a genuinely temporary container, using the
+`minio/minio` image's own bundled `mc` (MinIO Client) rather than a custom
+script — runs:
+
+```
+mc alias set local http://minio:9000 <root user> <root password>
+mc mb --ignore-existing local/stranger-club-local
+```
+
+then exits 0. `--ignore-existing` is what makes every subsequent `up`
+succeed cleanly instead of failing on "bucket already exists" — you'll see
+the same `Bucket created successfully` message either way; what matters is
+the exit code, not the wording.
+
+### Running tests against this stack
+
+The Compose containers expose the same ports the test suite's own
+environment variables expect — see [§15](#15-testing):
+
+```bash
+SC_TEST_DATABASE_URL=postgresql+psycopg://stranger_club:local-development-only@localhost:5432/stranger_club \
+SC_TEST_S3_BUCKET=stranger-club-local \
+SC_TEST_S3_ENDPOINT_URL=http://localhost:9000 \
+SC_TEST_S3_ACCESS_KEY_ID=local_storage_admin \
+SC_TEST_S3_SECRET_ACCESS_KEY=local_storage_admin_password \
+  pytest -q
+```
+
+(Run this from a native Python environment — §4 — with Compose's `postgres`
+and `minio` up; `pytest` itself is not one of the Compose services, since
+it needs to reach into the *test* database/bucket the suite manages
+itself, including dropping/recreating schemas between runs — not something
+you want the `app`/`migrate` services doing.)
+
+### A known local-only limitation: viewing a payment-proof image in the browser
+
+Payment-proof retrieval works by redirecting an authorized request to a
+**presigned URL** (§ `docs/storage.md`). That presigned URL is signed
+against whatever `SC_STORAGE_ENDPOINT_URL` the app was configured with —
+inside this Compose stack, that's `http://minio:9000`, a hostname that only
+resolves *inside* the Compose network. The backend-to-backend mechanics are
+correct and verified (signed, time-limited, 401 for anonymous requests,
+403 on direct anonymous bucket access) — but your **browser**, running on
+your host machine, cannot resolve `minio` any more than any other host
+process can, so following that redirect to actually render the image fails
+outside a container. This is a generic characteristic of any local
+Compose+MinIO setup, not specific to this application, and it does not
+exist in a real deployment (a real R2/S3 endpoint is a real public
+hostname any browser can resolve). Workaround, if you want to visually
+inspect proof images from your host browser during local development: add
+a hosts-file entry mapping `minio` to `127.0.0.1` (e.g.
+`echo "127.0.0.1 minio" | sudo tee -a /etc/hosts` on macOS/Linux). Not
+required for anything else — the MinIO console at `http://localhost:9001`
+(same root credentials) already lets you browse/download objects directly
+without this workaround.
+
+### How production differs
+
+| | Local (Compose) | Production |
+|---|---|---|
+| Database | `postgres` container, ephemeral local volume | A real managed PostgreSQL provider |
+| Object storage | `minio` container | A real S3-compatible provider (Cloudflare R2 recommended) |
+| Migration | `migrate` one-shot Compose service | An explicit `python -m backend.app.migrate` run in your deploy pipeline — see [§17](#17-production-configuration) |
+| `SC_ENV` | `development` | `production` — enables every fail-fast check in [§7](#7-environment-variables) |
+| Credentials | Baked-in local defaults | Real secrets, provisioned per [§17](#17-production-configuration)–[§18](#18-production-deployment-order) |
+| Reverse proxy / TLS | None (plain HTTP to `localhost:8000`) | Required — see [§17](#17-production-configuration) |
+
+Nothing in `backend/app/` contains Compose-specific or Render-specific
+logic — the application only ever sees `DATABASE_URL` and `SC_STORAGE_*`
+pointing at *something* that speaks PostgreSQL/S3; it has no idea whether
+that's `postgres`/`minio` or a real provider.
+
+---
+
+## 3. Prerequisites
 
 | Tool | Status | Verify with | Notes |
 |---|---|---|---|
 | Git | REQUIRED | `git --version` | |
-| Python 3.12 | REQUIRED | `python3 --version` | Pinned in `Dockerfile` (`python:3.12-slim`) and `.github/workflows/ci.yml`. A newer 3.x will likely work but is not what CI/production run. |
-| Node.js 22 | REQUIRED (frontend) | `node --version` | Pinned in `Dockerfile` (`node:22-alpine`) and CI. |
-| npm | REQUIRED (frontend) | `npm --version` | Ships with Node. |
-| Docker | REQUIRED for local PostgreSQL/MinIO and for building the production image; OPTIONAL if you only ever run the backend against SQLite | `docker --version` | |
-| `psql` (PostgreSQL client) | OPTIONAL — needed only to inspect a Postgres database directly or run `scripts/provision_database_roles.sql` | `psql --version` | |
-| `docker compose` | NOT USED — this repository has no `docker-compose.yml`. Every local container below is started with a plain `docker run`. | — | |
+| Docker, with Compose v2 | REQUIRED for the primary workflow (§2) | `docker --version`, `docker compose version` | Ships together in current Docker Desktop; installed separately as the `docker compose` plugin on Linux |
+| Python 3.12 | REQUIRED only for native/advanced development (§4) | `python3 --version` | Pinned in `Dockerfile` (`python:3.12-slim`) and `.github/workflows/ci.yml`. A newer 3.x will likely work but is not what CI/production run. |
+| Node.js 22 | REQUIRED only for native/advanced frontend development (§4) | `node --version` | Pinned in `Dockerfile` (`node:22-alpine`) and CI. |
+| npm | REQUIRED only for native/advanced frontend development (§4) | `npm --version` | Ships with Node. |
+| `psql` (PostgreSQL client) | OPTIONAL — inspecting a Postgres database directly, or running `scripts/provision_database_roles.sql` | `psql --version` | |
 
 DEVELOPMENT-ONLY vs PRODUCTION-ONLY is called out per-section below, not
 here — several tools above (Docker, `psql`) are used in both contexts.
 
 ---
 
-## 3. Clone and verify repository
+## 4. Clone and verify repository
+
+**Everything from here through §10 (Local S3 / MinIO) is the native/advanced
+development path** — editing backend/frontend code with native hot reload,
+outside a container. If you followed §2 (Docker Compose), you already have
+a running application and can skip straight to
+[§11](#11-database-migrations) onward.
 
 From wherever you keep projects:
 
@@ -87,9 +317,9 @@ overwrite.
 
 ---
 
-## 4. Python environment
+## 5. Python environment
 
-Supported version: **3.12** (see [§2](#2-prerequisites)).
+Supported version: **3.12** (see [§3](#3-prerequisites)).
 
 From the repository root:
 
@@ -129,7 +359,7 @@ pytest -q
 ```
 
 `pip check` reports dependency conflicts (should print nothing). `pytest -q`
-runs the full SQLite-backed test suite (see [§14](#14-testing)) — a clean
+runs the full SQLite-backed test suite (see [§15](#15-testing)) — a clean
 run is the real verification that the environment is usable.
 
 If you did not activate the venv, every `python`/`pytest`/`alembic`/`uvicorn`
@@ -139,9 +369,9 @@ activated form throughout for readability.
 
 ---
 
-## 5. Frontend environment
+## 6. Frontend environment
 
-Node 22 required (see [§2](#2-prerequisites)). No separate virtual
+Node 22 required (see [§3](#3-prerequisites)). No separate virtual
 environment concept for Node — `npm` installs into `node_modules/` inside
 the repository, ignored by `.gitignore`.
 
@@ -188,11 +418,11 @@ npm audit
 ```
 
 The backend (FastAPI/uvicorn) always runs separately, on port 8000 — see
-[§11](#11-starting-the-application).
+[§12](#12-starting-the-application).
 
 ---
 
-## 6. Environment variables
+## 7. Environment variables
 
 Read and validated once, at startup, by `backend/app/config.py` —
 `ConfigError` is raised (and the process refuses to start) for anything
@@ -207,14 +437,14 @@ an actual `os.getenv`/`os.environ` read in the code.
 | `SC_DATA_DIR` | Optional | Default `data` (relative to working directory) | Not used (production requires `DATABASE_URL`/S3, never the local-filesystem fallback) | Where the SQLite file and local uploads live in development |
 | `SC_DB_POOL_SIZE` | Optional | Default `5` | Tune per `docs/database.md`'s sizing formula | PostgreSQL connection pool size |
 | `SC_DB_MAX_OVERFLOW` | Optional | Default `5` | Tune per `docs/database.md` | PostgreSQL pool overflow |
-| `SC_AUTO_MIGRATE` | Optional | Default `true` | Set `false` once running more than one instance — see [§10](#10-database-migrations) | Whether the app applies migrations itself on startup |
+| `SC_AUTO_MIGRATE` | Optional | Default `true` | Set `false` once running more than one instance — see [§11](#11-database-migrations) | Whether the app applies migrations itself on startup |
 
 ### Auth / sessions
 
 | Variable | Required? | Development | Production | Meaning |
 |---|---|---|---|---|
 | `SC_ADMIN_USERNAME` | Optional | Default `organizer` | Same | Username of the auto-created first organizer |
-| `SC_ADMIN_PASSWORD` | **Required** the first time no organizer account exists yet — app refuses to start without it in that case | `<SET_THIS_SECRET>` — pick any local password | `<SET_THIS_SECRET>` — a real secret, never reused from dev | Password for the auto-created first organizer (see [§12](#12-first-adminorganizer-setup)) |
+| `SC_ADMIN_PASSWORD` | **Required** the first time no organizer account exists yet — app refuses to start without it in that case | `<SET_THIS_SECRET>` — pick any local password | `<SET_THIS_SECRET>` — a real secret, never reused from dev | Password for the auto-created first organizer (see [§13](#13-first-adminorganizer-setup)) |
 | `SC_SESSION_HOURS` | Optional | Default `12` | Same | Organizer session lifetime |
 | `SC_PLAYER_SESSION_DAYS` | Optional | Default `30` | Same | Player session lifetime |
 
@@ -224,7 +454,7 @@ an actual `os.getenv`/`os.environ` read in the code.
 |---|---|---|---|---|
 | `SC_ENV` | Optional | Default `development` | Set explicitly to `production` (or `staging`) — gates every fail-fast check in this table | `development` \| `staging` \| `production` |
 | `SC_COOKIE_SECURE` | Optional | Default off in `development` | Default **on** outside `development`; override with `true`/`false` | Sets the `Secure` flag on session cookies |
-| `SC_TRUSTED_PROXY_IPS` | **Required in `production`** | Unset (no proxy trust) | Comma-separated IP(s)/CIDR(s) of your reverse proxy — `<SET_THIS>` | Which peer's `X-Forwarded-For`/`X-Forwarded-Proto` to trust — see [§16](#16-production-configuration) |
+| `SC_TRUSTED_PROXY_IPS` | **Required in `production`** | Unset (no proxy trust) | Comma-separated IP(s)/CIDR(s) of your reverse proxy — `<SET_THIS>` | Which peer's `X-Forwarded-For`/`X-Forwarded-Proto` to trust — see [§17](#17-production-configuration) |
 | `SENTRY_DSN` | Optional | Unset | Set if using Sentry | Error tracking; only initializes if set |
 
 ### Object storage
@@ -252,7 +482,7 @@ automatically from `DATABASE_URL`'s dialect. Nothing to configure.
 |---|---|---|
 | `SC_DATA_DIR` | Set to `/data` inside the image (`Dockerfile`'s `ENV`) | Only meaningful if you run the container against SQLite/local storage (development only) |
 
-### Testing only (never used by the application itself — see [§14](#14-testing))
+### Testing only (never used by the application itself — see [§15](#15-testing))
 
 | Variable | Purpose |
 |---|---|
@@ -263,7 +493,7 @@ automatically from `DATABASE_URL`'s dialect. Nothing to configure.
 ### Backups (GitHub Actions secrets, not application environment variables)
 
 Referenced by `.github/workflows/backup.yml` (a template — see
-[§18](#18-backups)): `BACKUP_DATABASE_URL`, `BACKUP_STORAGE_ACCESS_KEY_ID`,
+[§19](#19-backups)): `BACKUP_DATABASE_URL`, `BACKUP_STORAGE_ACCESS_KEY_ID`,
 `BACKUP_STORAGE_SECRET_ACCESS_KEY`, `BACKUP_STORAGE_ENDPOINT_URL`,
 `BACKUP_STORAGE_BUCKET`, `BACKUP_STORAGE_REGION`. These are GitHub
 repository secrets/variables, set under *Settings → Secrets and variables →
@@ -275,7 +505,7 @@ own choice (not provided or assumed here).
 
 ---
 
-## 7. Local database
+## 8. Local database
 
 Two supported options.
 
@@ -300,7 +530,7 @@ For an *existing* SQLite file, step 3 instead runs the real
 
 `create_all()` is used **only** for this SQLite dev/test bootstrap. It is
 never used for PostgreSQL outside migration `0000_postgres_bootstrap.py`
-(see [§10](#10-database-migrations)).
+(see [§11](#11-database-migrations)).
 
 **SQLite is not suitable for production** — `config.py` refuses to start
 with `SC_ENV=staging` or `production` unless `DATABASE_URL` is a
@@ -311,11 +541,11 @@ PostgreSQL URL.
 **PostgreSQL is production-authoritative.** If you want your local setup to
 exercise the same code paths production does (row-level locking,
 `LISTEN`/`NOTIFY`, `JSONB`, composite foreign keys), run PostgreSQL locally
-— see [§8](#8-local-postgresql).
+— see [§9](#9-local-postgresql).
 
 ---
 
-## 8. Local PostgreSQL
+## 9. Local PostgreSQL
 
 Using Docker (no local PostgreSQL install needed):
 
@@ -375,7 +605,7 @@ removing it never affects anything outside your machine.
 
 ---
 
-## 9. Local S3 / MinIO
+## 10. Local S3 / MinIO
 
 Using Docker, matching exactly what `.github/workflows/ci.yml` runs:
 
@@ -455,7 +685,7 @@ Then re-run the `docker run` and bucket-creation commands above.
 
 ---
 
-## 10. Database migrations
+## 11. Database migrations
 
 Alembic is the sole authoritative migration system from its baseline
 (`0000_postgres_bootstrap.py`) forward. Current head: check
@@ -475,7 +705,7 @@ not how migrations are actually run here. The two real, working entry
 points are:
 
 1. **The application itself**, automatically, on startup (governed by
-   `SC_AUTO_MIGRATE`, default `true`) — see [§11](#11-starting-the-application).
+   `SC_AUTO_MIGRATE`, default `true`) — see [§12](#12-starting-the-application).
 2. **The explicit release-step command**, which reads `DATABASE_URL` from
    the environment via `config.py`:
 
@@ -495,7 +725,7 @@ points are:
    because the "fresh SQLite" bootstrap path (`create_all()` + stamp) only
    exists inside the application's own startup code, not in this
    standalone command. **For SQLite, do not use this command to create a
-   new database — just start the application** (§11), which bootstraps
+   new database — just start the application** (§12), which bootstraps
    correctly; use this command against SQLite only to apply migrations to
    a database that has already been bootstrapped at least once.
 
@@ -526,12 +756,12 @@ psql "$DATABASE_URL" -c "SELECT version_num FROM alembic_version;"
 `/ready` performs exactly this comparison itself, against the constant
 `ALEMBIC_EXPECTED_HEAD` in `backend/app/main.py` — a mismatch means new
 application code was deployed before its migration ran (or a migration
-partially failed). See [§22](#22-troubleshooting).
+partially failed). See [§23](#23-troubleshooting).
 
 **`SC_AUTO_MIGRATE`**: `true` (default) — the application runs migrations
 itself at startup, convenient for local dev and a single instance.
 `false` — migrations become a separate, explicit step you must run
-yourself (§17) before starting/rolling application instances; **required**
+yourself (§18) before starting/rolling application instances; **required**
 once you run more than one instance, so two instances don't both decide to
 migrate.
 
@@ -543,7 +773,11 @@ the lock stuck (Postgres releases it when the holding connection drops).
 
 ---
 
-## 11. Starting the application
+## 12. Starting the application
+
+This section is the **native/advanced path** (§4–§10). If you're using
+Docker Compose (§2), `docker compose up --build` already does all of this —
+there is nothing further to run.
 
 Two terminals, both from the repository root.
 
@@ -557,7 +791,7 @@ SC_DATA_DIR=./data SC_ADMIN_PASSWORD='local-dev-password' \
 
 (Replace the `SC_DATA_DIR`/env vars with `DATABASE_URL=...`,
 `SC_STORAGE_BACKEND=s3` etc. if you've set up local PostgreSQL/MinIO per
-§8/§9.)
+§9/§10.)
 
 **Terminal 2 — frontend:**
 
@@ -571,11 +805,11 @@ npm run dev
 | Organizer login | `http://localhost:5173/admin/login` | |
 | Backend directly | `http://localhost:8000/` | Same API the frontend proxies to |
 | Health | `http://localhost:8000/health` | Process is alive. Always `{"status":"ok"}` if the process is up at all. |
-| Readiness | `http://localhost:8000/ready` | Database reachable **and** at the expected Alembic revision. `200 {"status":"ready"}` or `503` — see [§22](#22-troubleshooting). |
+| Readiness | `http://localhost:8000/ready` | Database reachable **and** at the expected Alembic revision. `200 {"status":"ready"}` or `503` — see [§23](#23-troubleshooting). |
 
 ---
 
-## 12. First admin/organizer setup
+## 13. First admin/organizer setup
 
 There is no separate setup command. The first organizer account is created
 **automatically, at application startup**, if none exists yet
@@ -609,13 +843,20 @@ re-login) and confirm `GET /api/auth/me` reports `"role": "PLATFORM_ADMIN"`.
 
 ---
 
-## 13. First end-to-end test
+## 14. First end-to-end test
 
 A complete local walkthrough of the real product workflow. Assumes the
-backend and frontend are both running (§11) against either SQLite or local
+backend and frontend are both running (§12) against either SQLite or local
 PostgreSQL — either works identically for this walkthrough.
 
-1. **Start database, storage, backend, frontend** — §7–§11 above. (Local
+**If you're using Docker Compose (§2)**: everything below works the same,
+except there is no separate frontend dev server — the built frontend is
+served by the same app on `http://localhost:8000`, so read every
+`localhost:5173` below as `localhost:8000` and skip straight to step 2 (the
+OTP code in step 5 appears in `docker compose logs -f app` instead of a
+bare terminal).
+
+1. **Start database, storage, backend, frontend** — §8–§12 above. (Local
    filesystem storage, the SQLite-dev default, is fine for this walkthrough
    too — S3/MinIO is not required just to test the workflow.)
 2. **Log in as organizer**: `http://localhost:5173/admin/login` with
@@ -661,7 +902,7 @@ PostgreSQL — either works identically for this walkthrough.
 
 ---
 
-## 14. Testing
+## 15. Testing
 
 ```bash
 pytest -q
@@ -692,7 +933,7 @@ pytest -k "concurrent" -q
 
 Row locking, `LISTEN`/`NOTIFY`, `JSONB`, composite foreign keys, and
 least-privilege role boundaries only run against a real PostgreSQL
-instance — set `SC_TEST_DATABASE_URL` (§8 above for a local instance):
+instance — set `SC_TEST_DATABASE_URL` (§9 above for a local instance):
 
 ```bash
 SC_TEST_DATABASE_URL=postgresql+psycopg://stranger_club:local-dev-password@localhost:5432/stranger_club \
@@ -705,7 +946,7 @@ local/CI database, never anything you care about.
 
 ### S3/MinIO tests
 
-Set the `SC_TEST_S3_*` variables (§9 above for local MinIO):
+Set the `SC_TEST_S3_*` variables (§10 above for local MinIO):
 
 ```bash
 SC_TEST_S3_BUCKET=stranger-club-local \
@@ -738,11 +979,20 @@ npm audit
 
 ### Docker verification
 
-See [§15](#15-docker).
+See [§16](#16-docker).
 
 ---
 
-## 15. Docker
+## 16. Docker
+
+If you just want a running app, use **§2 (Docker Compose)** —
+`docker compose up --build` does everything below for you, with real
+PostgreSQL and MinIO containers wired up automatically. What follows is
+the manual, single-container path: useful for understanding exactly what
+the image contains, for the read-only/hardening verification later in this
+section, and as the native building block Compose itself builds on top of
+(`docker-compose.yml`'s `app`/`migrate` services build this exact
+`Dockerfile`, unmodified).
 
 Build the image — from the repository root:
 
@@ -753,11 +1003,17 @@ docker build -t stranger-club .
 This is a two-stage build: `node:22-alpine` builds the frontend
 (`npm ci && npm run build`), then the result is copied into a
 `python:3.12-slim` runtime image alongside the backend, running as a
-non-root user (`stranger_club`).
+non-root user (`stranger_club`). This is the same image used by
+`docker-compose.yml` (local) and the one you deploy to Render or any other
+Docker host (production) — nothing about the image itself is
+environment-specific; only the environment variables handed to it differ.
 
-Run it against local PostgreSQL and MinIO (§8/§9 — start those first, then
-connect the app container to them via `host.docker.internal`, or put all
-three containers on one Docker network):
+**Advanced/manual path** — run it against local PostgreSQL and MinIO
+containers by hand (§9/§10 — start those first, then connect the app
+container to them via `host.docker.internal`, or put all three containers
+on one Docker network). Compose (§2) does this same wiring for you
+automatically; this is the manual equivalent, useful for isolating a
+single-container question without the rest of the stack:
 
 ```bash
 docker network create stranger-club-net   # once
@@ -800,7 +1056,7 @@ storage (the production configuration). This genuinely requires **both**
 fails outright (`OSError: [Errno 30] Read-only file system: 'data'`), which
 is expected: local storage is a development/testing fallback that needs a
 writable directory, by design never used in production. Start MinIO first
-(§9), create its bucket, then:
+(§10), create its bucket, then:
 
 ```bash
 docker run -d --name stranger-club-app --network stranger-club-net \
@@ -818,7 +1074,7 @@ docker run -d --name stranger-club-app --network stranger-club-net \
 ```
 
 (`stranger-club-minio` here must be on the same `--network
-stranger-club-net` — re-run its `docker run` from §9 with
+stranger-club-net` — re-run its `docker run` from §10 with
 `--network stranger-club-net` added, and create the bucket against
 whatever host port you mapped for it.) `curl http://localhost:8000/ready`
 returning `200` with the container fully read-only is the actual proof —
@@ -845,13 +1101,14 @@ docker rm -f stranger-club-app stranger-club-postgres stranger-club-minio
 docker network rm stranger-club-net
 ```
 
-This repository has no `docker-compose.yml` — the commands above (plain
-`docker run` + a user-defined network) are the actual, verified way to run
-the full stack locally with Docker.
+The commands above (plain `docker run` + a user-defined network) are the
+verified manual way to run the full stack with Docker, container by
+container. For normal day-to-day local development, use `docker-compose.yml`
+(§2) instead — it does exactly this, deterministically, as one command.
 
 ---
 
-## 16. Production configuration
+## 17. Production configuration
 
 Intended architecture:
 
@@ -867,9 +1124,26 @@ None of the infrastructure below (a managed Postgres instance, a real
 bucket, a real reverse proxy) exists in this repository or this
 development environment — every item is something **you** provision.
 
+**This is not the same stack as §2's Docker Compose environment.** Compose
+exists only to make `localhost` development a single command; nothing about
+it is deployed anywhere. In production, the same `Dockerfile` image runs
+against a real managed PostgreSQL and a real S3-compatible bucket (e.g.
+Cloudflare R2) — MinIO is never used outside local development. If your
+deployment platform is Render specifically: deploy this repository as a
+**Docker Web Service** (it builds `Dockerfile` directly, the same image
+Compose builds locally), attach a Render managed PostgreSQL instance for
+`DATABASE_URL`, and set the `SC_STORAGE_*` variables to a real R2/S3
+bucket's credentials — Render itself needs no repository-specific
+configuration beyond the environment variables in
+[§7](#7-environment-variables), since the app has no Render-specific code
+path (see `docs/deployment.md` for the full local-vs-production
+comparison). No such deployment has actually been created from this
+environment — this section documents the intended pattern, not a live
+service.
+
 ### Required production environment variables
 
-See the full table in [§6](#6-environment-variables). At minimum for
+See the full table in [§7](#7-environment-variables). At minimum for
 `SC_ENV=production`: `DATABASE_URL` (PostgreSQL), `SC_ADMIN_PASSWORD`,
 `SC_STORAGE_BACKEND=s3` + its four required variables,
 `SC_TRUSTED_PROXY_IPS`. The app fails fast at startup if any of these is
@@ -929,14 +1203,14 @@ for a specific debugging need, never as a standing production setting.
 
 Leave `true` for a single instance. Set `false` once you run more than one
 application instance, and run `python -m backend.app.migrate` as an
-explicit step in your deploy pipeline instead (§17) — otherwise two
+explicit step in your deploy pipeline instead (§18) — otherwise two
 instances starting at once could both attempt to migrate simultaneously
 (safe, thanks to the advisory lock, but an explicit step is simpler to
 reason about and to gate a deploy on).
 
 ---
 
-## 17. Production deployment order
+## 18. Production deployment order
 
 Each step is labeled **[IMPLEMENTATION]** (something this repository's code
 already does for you) or **[PROVIDER/OPERATOR]** (something you must do
@@ -944,7 +1218,7 @@ against real infrastructure this repository cannot provision for you).
 
 1. **[PROVIDER/OPERATOR]** Provision a managed PostgreSQL instance (16+).
 2. **[PROVIDER/OPERATOR]** Provision the three database roles —
-   `scripts/provision_database_roles.sql` (§16).
+   `scripts/provision_database_roles.sql` (§17).
 3. **[PROVIDER/OPERATOR]** Provision a private S3-compatible bucket.
 4. **[IMPLEMENTATION, run by you]** Enable and verify bucket versioning:
    `python scripts/configure_bucket_protection.py --bucket <bucket> --enable`
@@ -954,7 +1228,10 @@ against real infrastructure this repository cannot provision for you).
    credentials, `SC_ADMIN_PASSWORD`, `SC_TRUSTED_PROXY_IPS`) in your
    deployment platform's secret store.
 6. **[PROVIDER/OPERATOR]** Deploy the application image
-   (`docker build -t stranger-club .` — §15 — pushed to your registry).
+   (`docker build -t stranger-club .` — §16 — pushed to your registry, or
+   built directly by your platform from `Dockerfile`). On Render
+   specifically: create a Docker Web Service pointed at this repository —
+   Render builds `Dockerfile` itself, no registry push needed.
 7. **[IMPLEMENTATION, run by you]** Run migrations as the explicit release
    step: `DATABASE_URL=<migrator-role-url> python -m backend.app.migrate`.
 8. **[IMPLEMENTATION]** Verify `/health` returns `200`.
@@ -965,7 +1242,7 @@ against real infrastructure this repository cannot provision for you).
 11. **[IMPLEMENTATION, run by you]** Verify authentication: log in as the
     organizer created from `SC_ADMIN_PASSWORD`.
 12. **[IMPLEMENTATION, run by you]** Verify the registration/payment
-    workflow end to end — the same steps as [§13](#13-first-end-to-end-test),
+    workflow end to end — the same steps as [§14](#14-first-end-to-end-test),
     against the real deployment.
 13. **[IMPLEMENTATION, run by you]** Verify teams/matches/results the same
     way.
@@ -975,13 +1252,13 @@ against real infrastructure this repository cannot provision for you).
     `docs/observability.md`).
 15. **[PROVIDER/OPERATOR]** Review, commit, and configure secrets for
     `.github/workflows/backup.yml` to actually enable scheduled backups
-    (§18 — it does nothing until you do this).
+    (§19 — it does nothing until you do this).
 16. **[IMPLEMENTATION, run by you]** Perform a restore drill —
-    `scripts/restore_test.py` — before considering backups "done" (§19).
+    `scripts/restore_test.py` — before considering backups "done" (§20).
 
 ---
 
-## 18. Backups
+## 19. Backups
 
 Two independent mechanisms — see `docs/backups.md` for full detail.
 
@@ -995,7 +1272,7 @@ Two independent mechanisms — see `docs/backups.md` for full detail.
    references under *Settings → Secrets and variables → Actions*. Until
    then, its presence in this repository means nothing is scheduled.
 
-The dump command it runs, using the read-only backup role (§16):
+The dump command it runs, using the read-only backup role (§17):
 
 ```bash
 pg_dump --dbname="$BACKUP_DATABASE_URL" -Fc -f "stranger-club-$(date -u +%Y-%m-%dT%H-%M-%SZ).dump"
@@ -1010,11 +1287,11 @@ either — retention/expiry is a deliberate lifecycle-policy decision, never
 something a routine backup run performs itself.
 
 **A backup succeeding proves nothing about whether it can be restored** —
-see [§19](#19-restore--disaster-recovery).
+see [§20](#20-restore--disaster-recovery).
 
 ---
 
-## 19. Restore / disaster recovery
+## 20. Restore / disaster recovery
 
 Run the automated restore test — this performs the full documented
 procedure against a disposable target database and prints a **measured**
@@ -1070,7 +1347,7 @@ report is clean.
 
 ---
 
-## 20. SQLite → PostgreSQL migration
+## 21. SQLite → PostgreSQL migration
 
 One-time data migration when cutting an existing SQLite deployment over to
 PostgreSQL. This is a row-by-row copy, not a schema transformation — the
@@ -1129,7 +1406,7 @@ python scripts/migrate_sqlite_to_postgres.py \
 
 ---
 
-## 21. Routine operations
+## 22. Routine operations
 
 **Check health / readiness:**
 
@@ -1139,7 +1416,7 @@ curl https://<host>/ready
 ```
 
 **Inspect operational internals** (requires a `PLATFORM_ADMIN` organizer
-session cookie — see [§12](#12-first-adminorganizer-setup)):
+session cookie — see [§13](#13-first-adminorganizer-setup)):
 
 ```bash
 curl -b <organizer-session-cookie> https://<host>/internal/diagnostics
@@ -1154,7 +1431,7 @@ log aggregation — every line carries a `request_id` (see
 `docs/observability.md`).
 
 **Inspect migration state**: `psql "$DATABASE_URL" -c "SELECT version_num FROM alembic_version;"`
-(§10).
+(§11).
 
 **Restart application**: platform-dependent; instances are stateless, so a
 normal restart is always safe (no drain procedure needed beyond what your
@@ -1172,11 +1449,29 @@ revoke the old one — see `docs/disaster-recovery.md` scenario H.
 **Verify proxy configuration**: confirm the application is unreachable
 except through your chosen proxy, and that a forged `X-Forwarded-For` sent
 *directly* to the application (bypassing the proxy) is not trusted — see
-[§16](#16-production-configuration).
+[§17](#17-production-configuration).
 
 ---
 
-## 22. Troubleshooting
+## 23. Troubleshooting
+
+### Docker Compose (§2 — most local development)
+
+| Problem | Likely cause | Diagnostic | Fix |
+|---|---|---|---|
+| `Cannot connect to the Docker daemon` | Docker Desktop/daemon not running | `docker info` | Start Docker Desktop (or your Docker daemon), then retry |
+| `Bind for 0.0.0.0:8000 failed: port is already allocated` (or 5432/9000/9001) | Something else on your machine already uses that host port | `lsof -i :8000` (or the relevant port) | Stop the other process, or set `APP_HOST_PORT`/`POSTGRES_HOST_PORT`/`MINIO_API_HOST_PORT`/`MINIO_CONSOLE_HOST_PORT` in a `.env` file (§2, `.env.example`) to an unused port — the app still talks to `postgres:5432`/`minio:9000` internally regardless of the host mapping |
+| `postgres` never becomes healthy | Corrupted/incompatible data in the named volume, or the container crashed | `docker compose logs postgres` | `docker compose down -v` for a full reset (destroys local data — see below), then `docker compose up --build` |
+| `minio` never becomes healthy | Same as above, MinIO side | `docker compose logs minio` | Same: `docker compose down -v` then `docker compose up --build` |
+| `migrate` service exits non-zero | A real migration error (bad `DATABASE_URL`, a broken migration) — `app` will never start, by design, since it depends on `migrate` completing successfully | `docker compose logs migrate` | Fix the underlying issue; `docker compose up --build` re-runs `migrate` (it's idempotent — already-applied migrations are a no-op) |
+| `minio-init` service exits non-zero | MinIO unreachable, or bad `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` — `mc alias set` or `mc mb` failed | `docker compose logs minio-init` | Confirm `minio` is healthy first; fix credentials if you overrode them in `.env`; re-run `docker compose up --build` |
+| `app` never becomes healthy | Usually one of the above still resolving, or a genuine startup error in the app itself | `docker compose ps`; `docker compose logs app` | Check `postgres`/`migrate`/`minio-init` are all healthy/exited-0 first, then read the app's own log for the real error |
+| `curl http://localhost:8000/ready` returns `503` even though `docker compose ps` shows `app` as healthy | `/health` (what Docker's `HEALTHCHECK` polls) only proves the process is alive — `/ready` separately checks DB connectivity and the Alembic head; a `503` here after `migrate` already completed suggests the app started before migrate's result was visible, or an unrelated DB connectivity issue | `docker compose logs app`; `docker compose logs migrate` | Should not happen given `migrate: condition: service_completed_successfully` — if it does, `docker compose restart app` and check logs for the actual `readiness_failed reason=...` |
+| Code changes don't seem to take effect | Compose reused a stale built image | — | `docker compose up --build` (the `--build` flag is what forces a rebuild — a bare `docker compose up` reuses whatever image already exists) |
+| Old/stale containers or volumes causing confusing behavior | Leftover state from a previous run | `docker compose ps -a`; `docker volume ls \| grep stranger_club` | `docker compose down` (keeps volumes/data) or `docker compose down -v` (destroys `stranger_club_postgres_data`/`stranger_club_minio_data` — full reset, local dev data only, see [§24](#24-clean-reset--local-restart)) |
+| Want to completely start over | Any of the above, or just want a clean slate | — | `docker compose down -v` then `docker compose up --build` — see [§24](#24-clean-reset--local-restart) |
+
+### Native/advanced path (§4–§10) and production
 
 | Problem | Likely cause | Diagnostic | Fix |
 |---|---|---|---|
@@ -1184,10 +1479,10 @@ except through your chosen proxy, and that a forged `X-Forwarded-For` sent
 | Backend won't start: `ConfigError: SC_ENV=... requires a PostgreSQL DATABASE_URL` | `SC_ENV` is `staging`/`production` with a SQLite/unset `DATABASE_URL` | `echo $DATABASE_URL $SC_ENV` | Set a real PostgreSQL `DATABASE_URL`, or use `SC_ENV=development` locally |
 | Backend won't start: `ConfigError: SC_ENV=production requires SC_TRUSTED_PROXY_IPS` | Deploying with `SC_ENV=production` but no proxy IP configured | — | Set `SC_TRUSTED_PROXY_IPS` to your real proxy's IP(s) |
 | Frontend won't start | `node_modules` missing/stale, or wrong Node version | `node --version`; `npm ci` | Reinstall with `npm ci` on Node 22 |
-| `sqlalchemy.exc.OperationalError: connection refused` | Postgres container not running / wrong host-port | `docker ps`; `docker exec <pg> pg_isready` | Start/fix the container (§8); check `DATABASE_URL` matches the mapped port |
-| `python -m backend.app.migrate` fails with `no such table: matches` on SQLite | Ran it against a SQLite file that doesn't exist yet | — | Don't — start the application instead for a fresh SQLite DB (§10) |
-| Bare `alembic current`/`upgrade` fails with `KeyError: 'url'` | `alembic.ini` has no `sqlalchemy.url` — expected in this repo | — | Use `python -m backend.app.migrate`, or the `Config.set_main_option` snippet in §10 |
-| `/ready` returns 503, `readiness_failed reason=alembic_head_mismatch` | New code deployed before its migration ran, or a migration partially failed | `psql "$DATABASE_URL" -c "SELECT version_num FROM alembic_version;"` vs. `ALEMBIC_EXPECTED_HEAD` in `main.py` | Run the pending migration (§10); see `docs/disaster-recovery.md` scenario G |
+| `sqlalchemy.exc.OperationalError: connection refused` | Postgres container not running / wrong host-port | `docker ps`; `docker exec <pg> pg_isready` | Start/fix the container (§9); check `DATABASE_URL` matches the mapped port |
+| `python -m backend.app.migrate` fails with `no such table: matches` on SQLite | Ran it against a SQLite file that doesn't exist yet | — | Don't — start the application instead for a fresh SQLite DB (§11) |
+| Bare `alembic current`/`upgrade` fails with `KeyError: 'url'` | `alembic.ini` has no `sqlalchemy.url` — expected in this repo | — | Use `python -m backend.app.migrate`, or the `Config.set_main_option` snippet in §11 |
+| `/ready` returns 503, `readiness_failed reason=alembic_head_mismatch` | New code deployed before its migration ran, or a migration partially failed | `psql "$DATABASE_URL" -c "SELECT version_num FROM alembic_version;"` vs. `ALEMBIC_EXPECTED_HEAD` in `main.py` | Run the pending migration (§11); see `docs/disaster-recovery.md` scenario G |
 | `/ready` returns 503, `readiness_failed reason=database_unavailable` | DB unreachable/credentials wrong | Check connectivity directly with `psql` | Fix connectivity/credentials |
 | Migration hangs | Another process/instance holds the advisory lock | Check for a concurrent migration run | Wait — it self-releases if the holder disconnects; never manually kill the DB connection unless certain no legitimate migration is in progress |
 | Storage upload fails, `503 STORAGE_UNAVAILABLE` | S3-compatible endpoint unreachable, wrong credentials/bucket | Check `SC_STORAGE_*`; `curl` the endpoint directly | Fix endpoint/credentials/bucket; see `storage_put_failed` in logs |
@@ -1198,18 +1493,45 @@ except through your chosen proxy, and that a forged `X-Forwarded-For` sent
 | Docker `HEALTHCHECK` failing | App not listening yet, or crashed | `docker logs <container>`; `docker inspect --format '{{json .State.Health}}' <container>` | Check startup logs for the real error |
 | Permission denied errors from `stranger_club_app` role | Attempting DDL with the app role, or role misconfigured | Which role is `DATABASE_URL` using? | The app role deliberately cannot `CREATE`/`DROP`/`ALTER` — use the migrator role for schema changes |
 | Forwarded headers not trusted / wrong client IP seen | `SC_TRUSTED_PROXY_IPS` unset or doesn't match the real proxy | Check the entrypoint's uvicorn args (`docker exec <c> ps aux`) | Set `SC_TRUSTED_PROXY_IPS` to the proxy's actual peer IP/CIDR |
-| Tests skipped unexpectedly | An `SC_TEST_*` variable is unset | `pytest -q -rs` | Set the relevant variable (§14) if you meant to run that suite |
+| Tests skipped unexpectedly | An `SC_TEST_*` variable is unset | `pytest -q -rs` | Set the relevant variable (§15) if you meant to run that suite |
 | PostgreSQL-specific test failure only | Real Postgres-only behavior (locking, composite FK, JSONB) — genuinely different from SQLite | Re-run in isolation: `pytest tests/test_x.py -k name -q` against `SC_TEST_DATABASE_URL` | Investigate the specific assertion; don't assume it's environmental without isolating it |
 | Backup workflow failing in GitHub Actions | Dump under the size floor, or upload/verify step failed | Read the failed step's log — it prints the dump size | Investigate the database/credentials for that step; a red run is the intended signal |
 | Restore fails validation | Backup itself is bad, or target wasn't empty | `scripts/restore_test.py`'s own printed report | Re-run against a genuinely empty target; investigate the specific failed check |
 
 ---
 
-## 23. Clean reset / local restart
+## 24. Clean reset / local restart
 
 Every command below is **local development only** — none of it is ever
 appropriate against a production database, bucket, or deployment. Read the
 label on each block before running it.
+
+### Docker Compose (§2 — most local development)
+
+```bash
+docker compose down          # stop containers, keep stranger_club_postgres_data / stranger_club_minio_data
+docker compose up -d         # restart with existing data intact
+```
+
+```bash
+docker compose down -v       # stop containers AND delete stranger_club_postgres_data / stranger_club_minio_data
+docker compose up --build    # fresh Postgres + fresh (empty) bucket, migrations re-run from scratch
+```
+
+`down -v` is a **local-development-only, destructive** command — it
+deletes both named volumes entirely. It is never appropriate against
+anything with a real hostname or managed-provider connection, and it has
+no equivalent meaning in production (there is no `docker-compose.yml`
+there — see [§17](#17-production-configuration)).
+
+```bash
+docker compose logs -f app       # tail one service's logs
+docker compose logs -f postgres
+docker compose logs -f minio
+docker compose ps                # see what's running/healthy/exited
+```
+
+### Native/advanced path (§4–§10)
 
 **Reset application code** (discard local uncommitted changes — be certain
 before running):
@@ -1232,14 +1554,14 @@ run against anything with a real hostname/managed-provider URL:
 
 ```bash
 docker rm -f stranger-club-postgres
-# then re-run the docker run command from §8
+# then re-run the docker run command from §9
 ```
 
 **Reset local MinIO data** — LOCAL DEVELOPMENT CONTAINER ONLY:
 
 ```bash
 docker rm -f stranger-club-minio
-# then re-run the docker run + bucket-creation commands from §9
+# then re-run the docker run + bucket-creation commands from §10
 ```
 
 **Reset all local Docker containers for this project**:
@@ -1255,11 +1577,11 @@ yourself while following this document.
 
 ---
 
-## 24. Security checklist
+## 25. Security checklist
 
 Before any production deployment:
 
-- [ ] Every required production environment variable is set (§6) — no
+- [ ] Every required production environment variable is set (§7) — no
       value copied from a local/dev example
 - [ ] No development fallback credentials anywhere in production
       configuration (check `SC_ADMIN_PASSWORD`, storage credentials)
@@ -1289,22 +1611,22 @@ Before any production deployment:
 
 ---
 
-## 25. Release checklist
+## 26. Release checklist
 
 Before every production deployment:
 
 - [ ] `pytest -q` green (SQLite)
 - [ ] `pytest -q` green against real PostgreSQL (`SC_TEST_DATABASE_URL`)
 - [ ] New/changed migrations reviewed (up **and** down, where a down
-      exists) — see [§10](#10-database-migrations)
+      exists) — see [§11](#11-database-migrations)
 - [ ] `npm run build` succeeds
 - [ ] `npm audit` reviewed (informational in CI — `continue-on-error`, but
       still worth reading)
 - [ ] `docker build -t stranger-club .` succeeds
 - [ ] Image tag/version identified and recorded
-- [ ] Migration executed against production as an explicit step (§17)
+- [ ] Migration executed against production as an explicit step (§18)
 - [ ] `/ready` healthy post-deploy
-- [ ] Smoke test performed against the real deployment (§13's steps, or a
+- [ ] Smoke test performed against the real deployment (§14's steps, or a
       subset)
 - [ ] Logs checked for unexpected errors immediately after deploy
 - [ ] Backup status checked (last successful run, if the backup workflow is
