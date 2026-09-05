@@ -83,9 +83,13 @@ below).
   `downgrade()` implementations. `0001`–`0005` have downgrades except `0005` (a one-way
   data migration, documented in its own file — reconstructing the old
   schema from a redesigned one would itself be lossy). Roll back a bad
-  migration with `alembic downgrade <revision>` using the same
-  `stranger_club_migrator` credential, or restore from backup if the
-  migration already ran destructively.
+  migration using the same `stranger_club_migrator` credential — see
+  `docs/runbook.md`'s migrations section for the exact command (this
+  repository's `alembic.ini` has no `sqlalchemy.url` configured, so the
+  bare `alembic downgrade <revision>` CLI command does not work standalone
+  here; a short `Config.set_main_option(...)` snippet is the verified
+  working method) — or restore from backup if the migration already ran
+  destructively.
 - **Database engine**: the SQLite code path remains fully functional in
   the codebase (dialect-detected, not removed) — a single-instance
   emergency rollback to SQLite is a configuration change, though any data
