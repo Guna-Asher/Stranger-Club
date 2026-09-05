@@ -12,11 +12,11 @@ from fastapi import HTTPException, UploadFile
 from PIL import Image, UnidentifiedImageError
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from .models import (
-    AuditLog, EventPaymentConfiguration, Fixture, FIXTURE_ROSTER_LOCKING_STATUSES, Match, Organizer, Payment,
-    PaymentProof, Registration, Team, TeamMember, User, now_ist,
+    ACTIVE_REGISTRATION_STATUSES, AuditLog, EventPaymentConfiguration, Fixture, FIXTURE_ROSTER_LOCKING_STATUSES,
+    Match, Organizer, Payment, PaymentProof, Registration, Team, TeamMember, User, now_ist,
 )
 from .schemas import (
     EventUpdate, FixtureCreate, FixtureUpdate, MatchCreate, PaymentConfigurationUpdate, RegistrationCreate,
@@ -763,6 +763,27 @@ def team_roster_response(session: Session, team: Team) -> dict:
     data = team_to_response(session, team)
     data["members"] = [team_member_to_response(m) for m in members]
     return data
+
+
+def event_teams_with_rosters(session: Session, event_id: int) -> list[dict]:
+    """The organizer team-list screen's data, in two queries total
+    regardless of team count — teams, then every member of every one of
+    those teams eager-loaded via selectinload, never one query per team
+    (see the Phase 4 plan's indexing/N+1 requirement)."""
+    teams = session.scalars(
+        select(Team).options(selectinload(Team.members).joinedload(TeamMember.registration))
+        .where(Team.event_id == event_id).order_by(Team.created_at)
+    ).all()
+    result = []
+    for team in teams:
+        data = {
+            "id": team.id, "event_id": team.event_id, "name": team.name, "short_code": team.short_code,
+            "max_size": team.max_size, "member_count": len(team.members),
+            "created_at": team.created_at, "updated_at": team.updated_at,
+            "members": [team_member_to_response(m) for m in sorted(team.members, key=lambda m: m.created_at)],
+        }
+        result.append(data)
+    return result
 
 
 def create_team(session: Session, match: Match, payload: TeamCreate, organizer: Organizer) -> Team:

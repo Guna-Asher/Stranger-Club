@@ -9,13 +9,21 @@ import PlayerStatus from './PlayerStatus';
 import { api, setCsrfToken } from '../lib/api';
 
 export default function PlayerApp({ publicId }) {
-  const [match, setMatch] = useState(); const [registration, setRegistration] = useState(); const [page, setPage] = useState('match'); const [error, setError] = useState(''); const [toast, setToast] = useState(''); const [playerVerified, setPlayerVerified] = useState(false); const key = `sc-registration-${publicId}`;
+  const [match, setMatch] = useState(); const [registration, setRegistration] = useState(); const [page, setPage] = useState('match'); const [error, setError] = useState(''); const [toast, setToast] = useState(''); const [playerVerified, setPlayerVerified] = useState(false); const [teamInfo, setTeamInfo] = useState(); const [fixtures, setFixtures] = useState(); const key = `sc-registration-${publicId}`;
   const load = async () => {
     try {
       setError(''); const item = await api(`/events/${publicId}`); setMatch(item);
       let verified = false;
       try { const auth = await api('/player/me', { authScope: 'player' }); setCsrfToken(auth.csrf_token, 'player'); verified = true; } catch { verified = false; }
       setPlayerVerified(verified);
+      if (verified) {
+        try {
+          const [team, matchList] = await Promise.all([
+            api(`/events/${publicId}/my-team`, { authScope: 'player' }), api(`/events/${publicId}/fixtures`, { authScope: 'player' }),
+          ]);
+          setTeamInfo(team); setFixtures(matchList);
+        } catch { setTeamInfo(); setFixtures(); }
+      } else { setTeamInfo(); setFixtures(); }
       const registrationId = localStorage.getItem(key);
       if (registrationId && verified) {
         try {
@@ -40,6 +48,12 @@ export default function PlayerApp({ publicId }) {
     // after a brief database blip) — some updates may have been missed
     // during the gap, so refetch rather than trust the stream was complete.
     stream.addEventListener('RESYNC', () => load());
+    // Phase 4: team/match changes are notified the same way — the payload
+    // itself is never trusted, only used as a signal to refetch (see
+    // deps.publish_event_update / services.py).
+    for (const kind of ['TEAM_CREATED', 'TEAM_UPDATED', 'TEAM_REMOVED', 'TEAM_MEMBER_ASSIGNED', 'TEAM_MEMBER_MOVED', 'TEAM_MEMBER_REMOVED', 'FIXTURE_CREATED', 'FIXTURE_UPDATED', 'FIXTURE_STATUS_CHANGED']) {
+      stream.addEventListener(kind, () => load());
+    }
     return () => stream.close();
   }, [publicId]);
   const save = (item) => { setRegistration(item); localStorage.setItem(key, item.public_id); };
@@ -49,6 +63,6 @@ export default function PlayerApp({ publicId }) {
     {page === 'match' && <Match match={match} join={() => setPage('form')} />}
     {page === 'form' && <Register match={match} back={() => setPage('match')} verified={playerVerified} onVerified={() => setPlayerVerified(true)} done={(item) => { save(item); setPage(item.status === 'WAITLISTED' ? 'status' : 'pay'); }} />}
     {page === 'pay' && <Pay registration={registration} back={() => setPage('form')} done={(item) => { save(item); setPage('status'); }} toast={setToast} />}
-    {page === 'status' && <PlayerStatus match={match} registration={registration} back={() => setPage('match')} retry={() => setPage('pay')} rejoin={() => setPage('form')} onCancelled={save} refresh={async () => { save(await api(`/registrations/${registration.public_id}`, { authScope: 'player' })); setToast('Status updated'); }} toast={setToast} />}
+    {page === 'status' && <PlayerStatus match={match} registration={registration} teamInfo={teamInfo} fixtures={fixtures} back={() => setPage('match')} retry={() => setPage('pay')} rejoin={() => setPage('form')} onCancelled={save} refresh={async () => { save(await api(`/registrations/${registration.public_id}`, { authScope: 'player' })); setToast('Status updated'); }} toast={setToast} />}
   </main>;
 }

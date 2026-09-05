@@ -134,6 +134,49 @@ only application code:
 | Valid state values | `CHECK` constraints on every status column |
 | Referential integrity | Foreign keys on every relationship |
 | QR source/key consistency | `CHECK` constraint tying `qr_source` to `qr_storage_key` nullability |
+| A team/match can only reference teams from its own event (Phase 4) | Composite foreign keys — see below |
+| A team's roster is frozen once it has played (Phase 4) | Application-level check (`services._assert_roster_unlocked`) — see `architecture.md` |
+
+**VERIFIED LOCALLY**: `backend/app/database.py` now sets `PRAGMA foreign_keys=ON`
+for every SQLite connection (previously unset — SQLite silently did not
+enforce *any* foreign key in this application before Phase 4, which was
+harmless only because every invariant that mattered was independently backed
+by a real unique/check constraint). This was a genuine, narrow correctness
+gap Phase 4 depended on fixing: the composite-FK technique below only
+provides a real guarantee if FK enforcement is actually on. The full
+pre-existing test suite was re-run immediately after this change, in
+isolation from the rest of the Phase 4 diff, and passed unchanged — SQLAlchemy's
+ORM-level `cascade="all, delete-orphan"` deletes children before parents
+regardless of this pragma, so no existing delete path was affected.
+
+## Cross-event integrity via composite foreign keys (Phase 4)
+
+`teams`, `team_members`, and `fixtures` (the internal name for a scheduled
+match between two teams — see `architecture.md`) all belong to exactly one
+event. Rather than relying only on an application-level check, the invariant
+"a team/match/membership can never span two different events" is enforced by
+the database itself:
+
+- `teams` gets `UNIQUE(id, event_id)` — normally redundant with the `id`
+  primary key alone, but it's the composite-FK *target* the next two points
+  reference.
+- `registrations` gets the equivalent `UNIQUE(id, match_id)`.
+- `team_members` carries both `team_id` and `registration_id`, plus a
+  denormalized `event_id`, with `FOREIGN KEY (team_id, event_id) REFERENCES
+  teams(id, event_id)` and `FOREIGN KEY (registration_id, event_id)
+  REFERENCES registrations(id, match_id)`. Both must independently resolve
+  to the *same* `event_id` for the row to insert at all — a membership
+  linking a team and a registration from two different events is
+  structurally impossible to write, not merely rejected by a Python check.
+- `fixtures` uses the identical technique for `team_a_id`/`team_b_id`
+  against `teams(id, event_id)`.
+
+**VERIFIED LOCALLY** against both SQLite (with the pragma above) and a real
+PostgreSQL 16 instance: a direct, ORM-level insert bypassing the service
+layer entirely raises `IntegrityError` on both dialects when it violates this
+(`tests/test_team_membership.py::test_database_itself_rejects_cross_event_team_membership`,
+`tests/test_fixtures.py::test_database_itself_rejects_cross_event_fixture`,
+the latter two gated on `SC_TEST_DATABASE_URL` for the real-PostgreSQL run).
 
 ## JSONB
 

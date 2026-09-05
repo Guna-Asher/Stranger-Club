@@ -11,8 +11,8 @@ from ..deps import (
 from ..models import Match, Organizer, Registration, Team, TeamMember, User
 from ..schemas import PlayerTeamResponse, TeamCreate, TeamMemberAssign, TeamMemberMove, TeamResponse, TeamRosterResponse, TeamUpdate
 from ..services import (
-    api_error, assign_team_member, create_team, delete_team, get_public_match, move_team_member,
-    player_team_response, remove_team_member, team_roster_response, team_to_response, update_team,
+    api_error, assign_team_member, create_team, delete_team, event_teams_with_rosters, get_public_match,
+    move_team_member, player_team_response, remove_team_member, team_roster_response, team_to_response, update_team,
 )
 
 router = APIRouter()
@@ -20,8 +20,7 @@ router = APIRouter()
 
 @router.get("/api/admin/events/{match_id}/teams", response_model=list[TeamRosterResponse])
 def admin_list_teams(match: Match = Depends(require_event_access), session: Session = Depends(get_session)):
-    teams = session.scalars(select(Team).where(Team.event_id == match.id).order_by(Team.created_at)).all()
-    return [team_roster_response(session, team) for team in teams]
+    return event_teams_with_rosters(session, match.id)
 
 
 @router.post("/api/admin/events/{match_id}/teams", response_model=TeamResponse, status_code=201)

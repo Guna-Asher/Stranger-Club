@@ -67,3 +67,55 @@ process:
 | Rate limiting | In-process `dict` buckets | PostgreSQL atomic upsert counters |
 | Migrations | `create_all()` + app-startup side effect | Explicit `alembic upgrade head` release step, advisory-lock guarded |
 | Concurrency control | SQLite `BEGIN IMMEDIATE` only | Dialect-aware: `BEGIN IMMEDIATE` (SQLite) or row-level `SELECT ... FOR UPDATE` (PostgreSQL) |
+
+## Phase 4: Events, Teams, and Matches
+
+Once a registration is `CONFIRMED`, an organizer can put players into Teams
+and schedule Matches between them:
+
+```
+Event (Match model) -> Registrations -> Teams -> TeamMembership -> Matches (Fixture model)
+```
+
+**A naming note, since it looks confusing in the code otherwise**: the
+existing `Match` SQLAlchemy class predates this phase and is actually the
+*Event* entity (name, date, venue, capacity, fee — a cricket gathering). The
+new "scheduled game between two teams" concept is internally named `Fixture`
+to avoid colliding with it. Every user-facing string in the product still
+says "Match"/"Matches" — this is a code-only naming choice, confined to
+`models.py`, `services.py`, and `routers/fixtures.py`.
+
+- **Team**: belongs to exactly one event. Deliberately minimal — no logos,
+  sponsors, ranking points, or player ratings.
+- **TeamMember**: links one `Registration` to one `Team`, both scoped to the
+  same event. Keyed to `Registration`, not the global/mutable
+  `PlayerProfile` — a `Registration` is already event-scoped and immutable
+  in the sense that matters (cancelling one never reactivates or rewrites
+  it; a new attempt is a brand-new row). This is what keeps team history
+  independent of a player later editing their profile. Only a `CONFIRMED`
+  registration is eligible; a registration cancellation cascades to remove
+  any team membership. Once a team has played (any fixture reaches
+  `IN_PROGRESS`/`COMPLETED`), its roster freezes — see `database.md`'s
+  schema-invariants table.
+- **Fixture** (UI: "Match"): a scheduled game between two teams of the same
+  event. Lifecycle `SCHEDULED -> IN_PROGRESS -> COMPLETED`, or
+  `-> CANCELLED` from either open state — forward-only, same reasoning as
+  the Event's own `VALID_EVENT_TRANSITIONS`. No live scoring, innings, or
+  result fields — that's a later phase (see below).
+- **Cross-event integrity** (a team from Event 1 appearing in Event 2's
+  match, or a registration from Event 2 becoming a member of Event 1's
+  team) is enforced by composite foreign keys at the database level, not
+  only application checks — see `database.md`.
+- **Realtime**: reuses the exact Phase 3 `PostgresBroadcaster`/
+  `InProcessBroadcaster` mechanism, publishing `TEAM_CREATED`,
+  `TEAM_UPDATED`, `TEAM_REMOVED`, `TEAM_MEMBER_ASSIGNED`,
+  `TEAM_MEMBER_MOVED`, `TEAM_MEMBER_REMOVED`, `FIXTURE_CREATED`,
+  `FIXTURE_UPDATED`, `FIXTURE_STATUS_CHANGED` — no new realtime mechanism.
+
+**Forward compatibility, not overbuilding**: no Result, MVP, or Media table
+exists yet (a later phase). `Fixture.id` is a stable, never-reused, never-
+deleted identity a future `Result`/`MatchMedia` row can reference without
+any redesign here; the roster-lock rule above is what makes "who was
+actually on the team when it played" a trustworthy fact by the time such a
+phase needs to read it, without a per-fixture roster snapshot table that
+nothing needs yet.

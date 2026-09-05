@@ -133,7 +133,7 @@ def test_health_public_event_and_migration(client: TestClient):
             assert {"20260818_domain_foundation", "20260818_payment_state_cleanup", "20260906_player_identity"}.issubset(versions)
         else:
             current_head = session.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            assert current_head == "0007"
+            assert current_head == "0008"
 
 
 def test_legacy_database_is_upgraded_without_losing_event_or_payment(tmp_path: Path):

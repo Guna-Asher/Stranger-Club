@@ -79,8 +79,8 @@ below).
 - **Application code**: redeploy the previous image tag. Stateless
   instances — no special drain procedure beyond what the platform already
   does for a normal deploy.
-- **Migrations**: `0006` and `0007` both have real, tested `downgrade()`
-  implementations. `0001`–`0005` have downgrades except `0005` (a one-way
+- **Migrations**: `0006`, `0007`, and `0008` all have real, tested
+  `downgrade()` implementations. `0001`–`0005` have downgrades except `0005` (a one-way
   data migration, documented in its own file — reconstructing the old
   schema from a redesigned one would itself be lossy). Roll back a bad
   migration with `alembic downgrade <revision>` using the same
