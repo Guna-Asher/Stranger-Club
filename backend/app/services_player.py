@@ -56,10 +56,15 @@ def verify_otp(session: Session, phone: str, code: str) -> User:
         raise api_error(401, "INVALID_OTP", "That code is invalid or has expired.")
     if challenge.attempts >= OTP_MAX_ATTEMPTS:
         session.commit()
+        logger.warning("otp_locked challenge_id=%s", challenge.id)
         raise api_error(429, "OTP_LOCKED", "Too many incorrect attempts. Request a new code.")
     challenge.attempts += 1
     if not secrets.compare_digest(challenge.code_hash, token_hash(code)):
         session.commit()
+        # Never logs the phone number or either code (attempted or correct)
+        # — same minimalism as otp_requested() above — only that an
+        # attempt against this challenge failed, and which challenge.
+        logger.warning("otp_verify_failed challenge_id=%s attempts=%s", challenge.id, challenge.attempts)
         raise api_error(401, "INVALID_OTP", "That code is invalid or has expired.")
     challenge.consumed_at = now_ist()
     user = session.scalar(select(User).where(User.phone == phone))

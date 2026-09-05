@@ -2,8 +2,14 @@
 
 Each scenario: **Detection → Containment → Recovery → Verification.**
 Written to be executable by another engineer, not just understandable by
-whoever wrote it — every command referenced actually exists in this repo
-and was exercised at least once while writing this document.
+whoever wrote it — every command referenced actually exists in this repo.
+Not every scenario's *full sequence* has been run end-to-end against real
+production infrastructure (none exists in this environment); each
+scenario below states plainly which parts were actually exercised here
+(**VERIFIED LOCALLY**) versus which are a documented, code-grounded
+procedure not yet run as a drill (**NOT YET DRILLED**) versus which
+require infrastructure this environment doesn't have
+(**DEPLOYMENT-TIME VERIFICATION**).
 
 ## A. Application instance failure
 
@@ -13,7 +19,10 @@ and was exercised at least once while writing this document.
   recover — instances are stateless (sessions, rate limits, and realtime
   fan-out all live in PostgreSQL).
 - **Verification**: `curl https://.../health` and `/ready` both return
-  200 from the replacement instance.
+  200 from the replacement instance. **NOT YET DRILLED** as a full scenario
+  (no load balancer exists in this environment to actually fail an
+  instance behind) — `/health` and `/ready` themselves are exercised by
+  every test run (**VERIFIED LOCALLY**).
 
 ## B. All instances restart
 
@@ -24,6 +33,9 @@ and was exercised at least once while writing this document.
   state is lost.
 - **Verification**: `/ready` green on every instance; open the app and
   confirm a live SSE connection receives the `summary` event on connect.
+  **NOT YET DRILLED** as a literal "restart every instance" exercise — the
+  underlying mechanisms (pool re-establishment, LISTEN reconnect) are each
+  individually **VERIFIED LOCALLY** via the automated realtime tests.
 
 ## C. PostgreSQL restart
 
@@ -35,7 +47,11 @@ and was exercised at least once while writing this document.
   re-`LISTEN`s every tracked topic, and pushes a `RESYNC` event to every
   locally-connected SSE client so nothing is silently stale.
 - **Verification**: `/ready` returns 200; check logs for
-  `realtime_listener_connected` after the restart.
+  `realtime_listener_connected` after the restart. **VERIFIED LOCALLY**:
+  the listener reconnect-and-RESYNC behavior this depends on was directly
+  exercised while building `PostgresBroadcaster` (killing and
+  re-establishing the LISTEN connection); a literal `docker restart` of
+  the production Postgres instance mid-traffic has not been drilled here.
 
 ## D. PostgreSQL data restoration required
 
@@ -50,8 +66,11 @@ and was exercised at least once while writing this document.
   `scripts/reconcile_storage.py` to confirm every referenced proof/QR
   object still resolves.
 - **Verification**: the restore script's own schema/FK/invariant/
-  application-level checks all pass; reconciliation reports no
-  `missing_from_storage`; resume traffic only after both are clean.
+  Alembic-head/application-level checks all pass; reconciliation reports
+  no `missing_from_storage`; resume traffic only after both are clean.
+  **VERIFIED LOCALLY**: this exact sequence (`pg_dump` -> fresh instance ->
+  `pg_restore` -> `scripts/restore_test.py` -> `scripts/reconcile_storage.py`)
+  was run for real against disposable local infrastructure this session.
 
 ## E. Object storage temporarily unavailable
 
@@ -66,7 +85,10 @@ and was exercised at least once while writing this document.
 - **Recovery**: automatic once the provider restores service; bounded
   retries in `S3Storage` already absorb brief blips.
 - **Verification**: manually retry a proof upload/retrieval; confirm the
-  `503` rate in logs returns to zero.
+  `503` rate in logs returns to zero. **VERIFIED LOCALLY**: a simulated
+  storage failure (via `FakeStorage.fail_on_put`) is covered by an
+  automated test confirming the clean `503` and that no orphaned DB row is
+  created.
 
 ## F. Payment-proof object deleted or missing
 
@@ -85,7 +107,10 @@ and was exercised at least once while writing this document.
 - **Verification**: re-run `scripts/reconcile_storage.py` and confirm the
   key resolves again (if recovered) or is explicitly documented as
   permanently lost (if not); review and tighten the IAM policy that made
-  this possible.
+  this possible. **VERIFIED LOCALLY**: the recovery path itself (an
+  overwritten-then-deleted object's prior versions remaining fetchable by
+  `VersionId`) was proven against a real MinIO bucket with versioning
+  enabled — see `storage.md`.
 
 ## G. A deployment introduces a bad migration
 
@@ -104,7 +129,11 @@ and was exercised at least once while writing this document.
 - **Verification**: `python -m backend.app.migrate` exits 0; `/ready`
   returns 200; re-run the migration test matrix against a copy of
   production data before retrying in production if the failure was
-  data-dependent.
+  data-dependent. **VERIFIED LOCALLY**: a deliberately broken migration
+  (a valid `ADD COLUMN` followed by a statement referencing a nonexistent
+  table) was run against a real PostgreSQL 16 instance in this session —
+  both the column addition and the `alembic_version` bump were rolled back
+  completely; the database was left exactly as it was before the attempt.
 
 ## H. Credentials must be rotated
 
@@ -118,4 +147,8 @@ and was exercised at least once while writing this document.
   one.
 - **Verification**: confirm new instances connect successfully with the new
   credential **before** revoking the old one; confirm the revoked
-  credential no longer authenticates afterward.
+  credential no longer authenticates afterward. **NOT YET DRILLED** — no
+  actual credential rotation has been performed in this environment; the
+  underlying role/credential model this procedure rotates is
+  **VERIFIED LOCALLY** (see `database.md`'s least-privilege tests), but the
+  rotation *procedure itself* is documented, not rehearsed.

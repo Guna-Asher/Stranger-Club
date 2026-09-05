@@ -30,6 +30,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -70,6 +71,24 @@ def restore_backup(backup_file: Path, target_url: str) -> float:
     return time.monotonic() - started
 
 
+def validate_alembic_head(target_url: str) -> dict:
+    """Explicit, standalone check — deliberately not folded into the
+    application-level check below, because create_app() defaults to
+    auto-migrating (SC_AUTO_MIGRATE=true), which would silently apply a
+    missing migration to the restored database and mask exactly the
+    mismatch this is supposed to catch."""
+    from backend.app.main import ALEMBIC_EXPECTED_HEAD
+
+    engine = create_engine(target_url)
+    with engine.connect() as conn:
+        if "alembic_version" not in inspect(engine).get_table_names():
+            engine.dispose()
+            return {"expected": ALEMBIC_EXPECTED_HEAD, "actual": None, "match": False}
+        actual = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one_or_none()
+    engine.dispose()
+    return {"expected": ALEMBIC_EXPECTED_HEAD, "actual": actual, "match": actual == ALEMBIC_EXPECTED_HEAD}
+
+
 def validate_restored_schema(target_url: str) -> dict:
     engine = create_engine(target_url)
     results = {}
@@ -100,12 +119,26 @@ def validate_application_level(target_url: str) -> dict:
     from backend.app.main import create_app
     from fastapi.testclient import TestClient
 
-    app = create_app(database_url=target_url, admin_username="__restore_test_probe__", admin_password="restore-test-probe-password")
-    results = {}
-    with TestClient(app) as client:
-        results["ready"] = client.get("/ready").status_code
-        results["public_events"] = client.get("/api/events").status_code
-    return results
+    # Force auto-migrate off for this check specifically: the point of
+    # validate_alembic_head() (and of this /ready check) is to confirm the
+    # RESTORE itself left the database at the correct migration state — if
+    # create_app() were allowed to auto-migrate here, a genuinely missing
+    # migration would get silently applied before /ready ever saw it,
+    # masking exactly the failure this script exists to catch.
+    previous = os.environ.get("SC_AUTO_MIGRATE")
+    os.environ["SC_AUTO_MIGRATE"] = "false"
+    try:
+        app = create_app(database_url=target_url, admin_username="__restore_test_probe__", admin_password="restore-test-probe-password")
+        results = {}
+        with TestClient(app) as client:
+            results["ready"] = client.get("/ready").status_code
+            results["public_events"] = client.get("/api/events").status_code
+        return results
+    finally:
+        if previous is None:
+            os.environ.pop("SC_AUTO_MIGRATE", None)
+        else:
+            os.environ["SC_AUTO_MIGRATE"] = previous
 
 
 def validate_storage(database_url: str, bucket: str | None, storage_kwargs: dict) -> dict | None:
@@ -142,6 +175,17 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 1
     print(f"pg_restore completed in {restore_seconds:.1f}s")
+
+    alembic_result = validate_alembic_head(args.target_url)
+    print("Alembic head check:", alembic_result)
+    if not alembic_result["match"]:
+        print(
+            f"ALEMBIC HEAD MISMATCH: restored database is at {alembic_result['actual']!r}, "
+            f"code expects {alembic_result['expected']!r}. The backup is either stale relative to "
+            f"the deployed code, or the restore is incomplete.",
+            file=sys.stderr,
+        )
+        return 1
 
     schema_results = validate_restored_schema(args.target_url)
     violations = {k: v for k, v in schema_results.items() if k != "row_counts" and v}

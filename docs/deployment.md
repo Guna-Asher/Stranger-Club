@@ -57,13 +57,17 @@ docker run -d \
   -p 8000:8000 stranger-club
 ```
 
-Verified in this environment: the image runs as a non-root user
-(`stranger_club`), passes its `HEALTHCHECK`, and serves the full
-registration → payment-proof-upload (to real S3-compatible storage) →
-organizer-review flow with **no writable filesystem at all** (`--read-only
---tmpfs /tmp`) when using PostgreSQL + S3 backends — the only filesystem
-writes this application ever needs (`SC_DATA_DIR` for SQLite/local
-storage) are development-only.
+**VERIFIED LOCALLY**: the image runs as a non-root user (`stranger_club`),
+passes its `HEALTHCHECK`, and serves the full registration →
+payment-proof-upload → organizer-review flow with **no writable filesystem
+at all** (`--read-only --tmpfs /tmp`) when using a real PostgreSQL
+container and a real S3-compatible (MinIO) container for storage — the
+only filesystem writes this application ever needs (`SC_DATA_DIR` for
+SQLite/local storage) are development-only. **Not verified against a real
+managed PostgreSQL provider or a real R2/S3 account** — only against
+disposable local containers, since no production accounts exist in this
+environment (**IMPLEMENTED BUT REQUIRES REAL PROVIDER CONFIGURATION** to
+confirm end-to-end against the actual chosen providers).
 
 `SC_TRUSTED_PROXY_IPS` is consumed by `docker-entrypoint.sh`, which passes
 `--proxy-headers --forwarded-allow-ips=<value>` to uvicorn when set —
@@ -98,15 +102,40 @@ below).
 - TLS terminates at the proxy/LB.
 - HTTP → HTTPS redirect enforced at the proxy.
 - `SC_COOKIE_SECURE` (on by default outside `SC_ENV=development`) sets the
-  `Secure` flag on both session cookies.
-- `SC_TRUSTED_PROXY_IPS` → uvicorn's `--forwarded-allow-ips` — the
+  `Secure` flag on both session cookies. **VERIFIED LOCALLY** (unit test).
+- `SC_TRUSTED_PROXY_IPS` → `docker-entrypoint.sh` translates it into
+  uvicorn's `--proxy-headers --forwarded-allow-ips=<value>` — the
   application only trusts `X-Forwarded-For`/`X-Forwarded-Proto` from a
   connection whose direct TCP peer is this configured proxy IP/CIDR.
-  Without this set correctly, a client cannot spoof its IP to bypass
-  IP-based rate limiting.
+  Without this set correctly (or with it unset), forwarded headers are
+  never trusted at all and `request.client.host` is the direct TCP peer —
+  the safe default. `SC_ENV=production` refuses to start without this set
+  (`backend/app/config.py`).
+  - **VERIFIED LOCALLY**: the entrypoint script's own logic — that it adds
+    the flag with the exact configured value(s) when the variable is set,
+    and adds no forwarding trust at all when it's unset — is covered by an
+    automated test (`test_entrypoint_trusts_*` in
+    `tests/test_phase3_infrastructure.py`) that captures the real arguments
+    the script would hand to uvicorn, without starting a real server.
+  - **DEPLOYMENT-TIME VERIFICATION REQUIRED**: that the *actual* production
+    load balancer/proxy (whichever is chosen) sends requests from the exact
+    IP(s)/CIDR(s) configured in `SC_TRUSTED_PROXY_IPS`, and that no other
+    path to the application exists that bypasses it (e.g. the application
+    port is not directly internet-reachable — only the proxy is). This
+    cannot be verified in this environment, since no real production
+    proxy/LB exists here. Before going live: confirm the application is
+    unreachable except through the chosen proxy, and that a request with a
+    forged `X-Forwarded-For` sent *directly* to the application (bypassing
+    the proxy) does not get trusted — the fact that direct access should be
+    network-blocked in the first place is itself a deployment configuration
+    requirement, not something this application's code can enforce.
+  - Development/local defaults (`SC_TRUSTED_PROXY_IPS` unset) must always be
+    replaced with the real proxy's address(es) before deploying — never
+    reuse a placeholder or wildcard value.
 - Add a request body size cap at the proxy (e.g. Nginx
   `client_max_body_size 6m;`) ahead of the application's own 5MB/2MB upload
   validation — defense in depth against many concurrent large requests
-  before the app-level check rejects any single one.
+  before the app-level check rejects any single one. **DEPLOYMENT-TIME
+  VERIFICATION** (proxy-specific configuration, not exercised here).
 - Request timeouts are handled at the proxy layer (e.g. 30s) — no
-  additional application middleware.
+  additional application middleware. **DEPLOYMENT-TIME VERIFICATION.**

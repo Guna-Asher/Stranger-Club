@@ -33,7 +33,7 @@ The frontend is a static SPA served by the same FastAPI process
 | Storage | `put`/`get`/`exists`/`presigned_url` — local filesystem (dev), S3-compatible (prod), in-memory fake (tests) | `backend/app/storage.py`, `storage_s3.py`, `storage_fake.py` |
 | Realtime | SSE fan-out per event; in-process (dev/SQLite) or PostgreSQL LISTEN/NOTIFY (prod) | `backend/app/realtime.py` |
 | Rate limiting | Atomic, PostgreSQL-backed fixed-window counters, shared across instances | `backend/app/rate_limit.py` |
-| Correlation IDs | Per-request ID threaded through logs and error responses | `backend/app/middleware.py` |
+| Correlation IDs | Per-request ID threaded through logs and error responses — see `observability.md` | `backend/app/middleware.py` |
 | Services | All business logic and state machines (registration, payment, audit) | `backend/app/services.py`, `services_player.py` |
 | Routers | HTTP surface, thin — authorization + calling into services | `backend/app/routers/` |
 

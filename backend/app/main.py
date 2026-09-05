@@ -155,10 +155,12 @@ def create_app(
                 if dialect == "postgresql":
                     current = session.execute(text("SELECT version_num FROM alembic_version")).scalar_one_or_none()
                     if current != ALEMBIC_EXPECTED_HEAD:
+                        logger.error("readiness_failed reason=alembic_head_mismatch expected=%s actual=%s", ALEMBIC_EXPECTED_HEAD, current)
                         raise api_error(503, "NOT_READY", "Database schema is not at the expected migration.")
         except HTTPException:
             raise
         except Exception:
+            logger.error("readiness_failed reason=database_unavailable")
             raise api_error(503, "NOT_READY", "Database is unavailable")
         return {"status": "ready"}
 

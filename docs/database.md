@@ -44,34 +44,32 @@ connection budget above is genuinely tight.
 
 ## Database credentials (least privilege)
 
-Do not run the application as a PostgreSQL superuser. Provision two roles:
+Do not run the application as a PostgreSQL superuser. Three roles — not a
+complicated RBAC hierarchy, exactly the three real responsibilities that
+exist:
 
-```sql
--- Run once by a superuser/admin during provisioning.
-CREATE ROLE stranger_club_migrator LOGIN PASSWORD '...';
-CREATE ROLE stranger_club_app LOGIN PASSWORD '...';
+| Role | Used by | Privileges |
+|---|---|---|
+| `stranger_club_migrator` | `python -m backend.app.migrate` only; also owns the schema for restore (`scripts/restore_test.py` targets a fresh database it can fully recreate) | DDL, schema owner |
+| `stranger_club_app` | The running application (`DATABASE_URL`) | `SELECT`/`INSERT`/`UPDATE`/`DELETE` only — no `CREATE`/`DROP`/`ALTER` |
+| `stranger_club_backup` | `pg_dump` only (see `backups.md`) | Read-only (`pg_read_all_data`) — cannot write, cannot DROP, cannot touch other roles |
 
-CREATE DATABASE stranger_club OWNER stranger_club_migrator;
+Full provisioning SQL: `scripts/provision_database_roles.sql` (run once by
+a superuser/admin against a fresh database, then run
+`python -m backend.app.migrate` as the migrator before the `GRANT`s that
+reference existing tables).
 
-\c stranger_club
-GRANT USAGE, CREATE ON SCHEMA public TO stranger_club_migrator;
-GRANT USAGE ON SCHEMA public TO stranger_club_app;
-
--- After the migrator has run `alembic upgrade head` at least once:
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO stranger_club_app;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO stranger_club_app;
-ALTER DEFAULT PRIVILEGES FOR ROLE stranger_club_migrator IN SCHEMA public
-    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO stranger_club_app;
-ALTER DEFAULT PRIVILEGES FOR ROLE stranger_club_migrator IN SCHEMA public
-    GRANT USAGE, SELECT ON SEQUENCES TO stranger_club_app;
-```
-
-- `stranger_club_migrator`: DDL rights, owns the schema. Used **only** by
-  `python -m backend.app.migrate` (the release-phase step). Never embedded
-  in the running application's `DATABASE_URL`.
-- `stranger_club_app`: DML only (`SELECT`/`INSERT`/`UPDATE`/`DELETE`), no
-  `CREATE`/`DROP`/`ALTER`. This is the credential the running application
-  uses.
+**This boundary is not just documented — it is tested against a real
+PostgreSQL instance.** `tests/test_phase3_infrastructure.py`'s
+`TestDatabaseLeastPrivilege` class connects as each role and asserts:
+`stranger_club_app` gets `permission denied` on `CREATE TABLE` but can read
+and write existing tables; `stranger_club_backup` can `SELECT` but gets
+`permission denied` on `INSERT` and `DROP TABLE`. Verified locally in this
+environment against a disposable PostgreSQL 16 container — provisioning the
+same three roles against the real production database and setting
+`SC_TEST_APP_ROLE_URL` / `SC_TEST_BACKUP_ROLE_URL` re-runs the same proof
+there; this has not been done against a real managed-provider account in
+this environment, since none exists here.
 
 ## Migrations
 

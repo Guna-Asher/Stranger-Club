@@ -87,13 +87,21 @@ SC_STORAGE_ADMIN_ACCESS_KEY_ID=... SC_STORAGE_ADMIN_SECRET_ACCESS_KEY=... \
 
 ## Common failure signatures in logs
 
+Full category-by-category coverage (including what's deliberately never
+logged) is in `observability.md`. Quick reference for the most
+operationally relevant lines:
+
 | Log line | Meaning | Where to look |
 |---|---|---|
 | `migration_lock_acquired` / `migration_lock_released` | Normal migration run | `database.md` |
+| `readiness_failed reason=alembic_head_mismatch` | `/ready` found the DB at an unexpected migration revision | New code deployed before its migration ran, or a migration partially failed — see `disaster-recovery.md` scenario G |
+| `readiness_failed reason=database_unavailable` | `/ready` couldn't reach the database at all | Check DB connectivity/credentials |
 | `realtime_listener_disconnected, reconnecting in Ns` | PostgreSQL LISTEN connection dropped (DB restart/network blip) | Expect a `realtime_listener_connected` shortly after; if not, check DB connectivity |
 | `realtime_notify_failed` | A single realtime publish failed (best-effort) | Never affects correctness — the next fetch/reconnect self-heals; investigate if frequent |
 | `rate_limit_backend_unavailable` | The rate-limit table couldn't be read/written | Requests fail closed (429) — check DB connectivity |
 | `storage_put_failed` / `storage_get_failed` / `storage_presign_failed` | Object storage call failed after bounded retries | Client sees a clean 503 — check the storage provider's status |
+| `csrf_invalid` | A request's CSRF header didn't match the session's token | Occasional: stale frontend tab. Frequent from one IP/user: investigate |
+| `otp_locked` | A phone's OTP challenge hit its max wrong-attempt count | Expected for a player who mistyped repeatedly; frequent across many phones from one IP suggests abuse — cross-check the IP-scoped OTP rate limits |
 | `unexpected_error` | An unhandled exception — full traceback logged server-side only | Client only ever sees a generic message + `request_id`; grep logs for that ID |
 
 Every log line and every error response carries a `request_id` — use it to

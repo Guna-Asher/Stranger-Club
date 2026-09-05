@@ -6,6 +6,7 @@ framework — per the Phase 3 spec's own instruction.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,8 @@ from fastapi.testclient import TestClient
 from backend.app.config import ConfigError, load_config
 from backend.app.main import create_app
 from backend.app.storage_fake import FakeStorage
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 
 # --- Configuration fail-fast (section 15 / S) --------------------------------
@@ -256,6 +259,37 @@ def test_ready_returns_503_when_alembic_head_does_not_match_expected(monkeypatch
 
 
 @pytest.mark.skipif("SC_TEST_DATABASE_URL" not in os.environ, reason="requires a real PostgreSQL instance (set SC_TEST_DATABASE_URL)")
+def test_restore_scripts_alembic_check_detects_a_real_mismatch():
+    """scripts/restore_test.py's validate_alembic_head() must actually
+    detect a stale/incomplete restore, not just always report a match."""
+    from sqlalchemy import create_engine, text as sa_text
+    from restore_test import validate_alembic_head
+
+    database_url = os.environ["SC_TEST_DATABASE_URL"]
+    reset_engine = create_engine(database_url)
+    with reset_engine.begin() as conn:
+        conn.execute(sa_text("DROP SCHEMA public CASCADE"))
+        conn.execute(sa_text("CREATE SCHEMA public"))
+    reset_engine.dispose()
+
+    app = create_app(database_url=database_url, admin_password="x")
+    with TestClient(app):
+        pass  # runs migrations to head via the normal startup path
+
+    good = validate_alembic_head(database_url)
+    assert good["match"] is True
+
+    engine = create_engine(database_url)
+    with engine.begin() as conn:
+        conn.execute(sa_text("UPDATE alembic_version SET version_num = '0002'"))
+    engine.dispose()
+
+    bad = validate_alembic_head(database_url)
+    assert bad["match"] is False
+    assert bad["actual"] == "0002"
+
+
+@pytest.mark.skipif("SC_TEST_DATABASE_URL" not in os.environ, reason="requires a real PostgreSQL instance (set SC_TEST_DATABASE_URL)")
 def test_connection_pool_exhaustion_fails_fast_rather_than_hanging(monkeypatch):
     """Holds every pooled connection open, then confirms the next request
     fails within pool_timeout rather than hanging indefinitely."""
@@ -281,3 +315,202 @@ def test_connection_pool_exhaustion_fails_fast_rather_than_hanging(monkeypatch):
         for conn in held:
             conn.close()
         engine.dispose()
+
+
+# --- Bucket versioning / overwrite-and-delete recovery (Phase 3 hardening, section A) ---
+
+@pytest.mark.skipif("SC_TEST_S3_ENDPOINT_URL" not in os.environ, reason="requires a real S3-compatible endpoint (set SC_TEST_S3_ENDPOINT_URL etc.)")
+def test_bucket_versioning_can_be_enabled_and_is_verified_by_readback():
+    """scripts/configure_bucket_protection.py must never claim success
+    without reading the status back from the provider — this exercises the
+    real enable+verify round trip against a real endpoint (MinIO in CI)."""
+    from configure_bucket_protection import enable_versioning, get_versioning_status
+
+    client = _test_s3_admin_client()
+    bucket = os.environ["SC_TEST_S3_BUCKET"]
+
+    result = enable_versioning(client, bucket)
+    assert result["outcome"] == "VERIFIED_ENABLED", (
+        f"This endpoint did not confirm versioning enabled: {result}. If this is a genuine "
+        f"provider limitation (not a bug), this test documents that limitation rather than "
+        f"hiding it — do not weaken this assertion to force a pass."
+    )
+    assert get_versioning_status(client, bucket) == "Enabled"
+
+
+@pytest.mark.skipif("SC_TEST_S3_ENDPOINT_URL" not in os.environ, reason="requires a real S3-compatible endpoint (set SC_TEST_S3_ENDPOINT_URL etc.)")
+def test_versioned_bucket_recovers_overwritten_and_deleted_objects():
+    """The actual protection versioning buys: even after an overwrite and a
+    delete, every prior version's bytes remain fetchable by VersionId. This
+    is what makes "the runtime credential can't delete proofs" a
+    belt-and-suspenders guarantee rather than the only line of defence."""
+    import uuid
+    from configure_bucket_protection import enable_versioning
+
+    client = _test_s3_admin_client()
+    bucket = os.environ["SC_TEST_S3_BUCKET"]
+    enable_versioning(client, bucket)  # idempotent if already enabled
+
+    key = f"proofs/{uuid.uuid4().hex}.png"
+    client.put_object(Bucket=bucket, Key=key, Body=b"original-evidence")
+    client.put_object(Bucket=bucket, Key=key, Body=b"overwritten-bytes")
+    client.delete_object(Bucket=bucket, Key=key)
+
+    # Normal GET now reports not-found, exactly as the application's own
+    # Storage.get() would see it.
+    from botocore.exceptions import ClientError
+    with pytest.raises(ClientError):
+        client.get_object(Bucket=bucket, Key=key)
+
+    # But both real versions are still recoverable by an operator with the
+    # admin credential.
+    versions = client.list_object_versions(Bucket=bucket, Prefix=key)
+    bodies = {
+        client.get_object(Bucket=bucket, Key=key, VersionId=v["VersionId"])["Body"].read()
+        for v in versions.get("Versions", [])
+    }
+    assert bodies == {b"original-evidence", b"overwritten-bytes"}
+    assert len(versions.get("DeleteMarkers", [])) == 1
+
+
+def _test_s3_admin_client():
+    import boto3
+    return boto3.client(
+        "s3", endpoint_url=os.environ["SC_TEST_S3_ENDPOINT_URL"],
+        aws_access_key_id=os.environ["SC_TEST_S3_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["SC_TEST_S3_SECRET_ACCESS_KEY"],
+        region_name=os.environ.get("SC_TEST_S3_REGION", "us-east-1"),
+    )
+
+
+# --- Database least-privilege roles (Phase 3 hardening, section B) ----------
+#
+# Requires two role-scoped connection strings against a real PostgreSQL
+# instance where the two roles (matching scripts/provision_database_roles.sql)
+# already exist — these are NOT the same as SC_TEST_DATABASE_URL (which
+# connects as whatever role owns the test database, typically superuser-ish
+# in a disposable test container). Skipped entirely otherwise: this proves
+# real role boundaries against real PostgreSQL, never fabricated.
+#
+# Re-grants privileges on every test (autouse fixture below) rather than
+# assuming they were set up once and left alone: other tests in this suite
+# legitimately DROP SCHEMA public CASCADE between runs (see the `client`
+# fixture's _reset_postgres_schema), which also wipes any grants made to
+# these roles on the schema's previous incarnation — this class must not
+# silently start reporting false "permission denied" results (for the wrong
+# reason: the schema/tables not being visible at all) just because it ran
+# after another test reset the schema.
+
+@pytest.mark.skipif(
+    "SC_TEST_APP_ROLE_URL" not in os.environ or "SC_TEST_BACKUP_ROLE_URL" not in os.environ or "SC_TEST_DATABASE_URL" not in os.environ,
+    reason="requires SC_TEST_APP_ROLE_URL, SC_TEST_BACKUP_ROLE_URL, and SC_TEST_DATABASE_URL (used to (re-)apply grants) all pointing at the same real PostgreSQL instance",
+)
+class TestDatabaseLeastPrivilege:
+    @pytest.fixture(autouse=True)
+    def _regrant_privileges(self):
+        from sqlalchemy import create_engine, text as sa_text
+        from sqlalchemy.engine import make_url
+
+        app_role = make_url(os.environ["SC_TEST_APP_ROLE_URL"]).username
+        backup_role = make_url(os.environ["SC_TEST_BACKUP_ROLE_URL"]).username
+        engine = create_engine(os.environ["SC_TEST_DATABASE_URL"])
+        with engine.begin() as conn:
+            conn.execute(sa_text(f'GRANT USAGE ON SCHEMA public TO "{app_role}"'))
+            conn.execute(sa_text(f'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "{app_role}"'))
+            conn.execute(sa_text(f'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO "{app_role}"'))
+            conn.execute(sa_text(f'GRANT USAGE ON SCHEMA public TO "{backup_role}"'))
+            conn.execute(sa_text(f'GRANT pg_read_all_data TO "{backup_role}"'))
+        engine.dispose()
+        yield
+    def test_app_role_cannot_perform_ddl(self):
+        from sqlalchemy import create_engine, text as sa_text
+        from sqlalchemy.exc import DBAPIError
+
+        engine = create_engine(os.environ["SC_TEST_APP_ROLE_URL"])
+        try:
+            with engine.connect() as conn:
+                with pytest.raises(DBAPIError, match="permission denied"):
+                    conn.execute(sa_text("CREATE TABLE sc_privilege_test_should_never_exist (id int)"))
+        finally:
+            engine.dispose()
+
+    def test_app_role_can_perform_dml(self):
+        from sqlalchemy import create_engine, text as sa_text
+
+        engine = create_engine(os.environ["SC_TEST_APP_ROLE_URL"])
+        try:
+            with engine.connect() as conn:
+                # Any existing table works for this check; organizers always
+                # exists post-migration.
+                result = conn.execute(sa_text("SELECT COUNT(*) FROM organizers"))
+                assert result.scalar_one() >= 0
+        finally:
+            engine.dispose()
+
+    def test_backup_role_can_read_but_not_write_or_ddl(self):
+        from sqlalchemy import create_engine, text as sa_text
+        from sqlalchemy.exc import DBAPIError
+
+        engine = create_engine(os.environ["SC_TEST_BACKUP_ROLE_URL"])
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(sa_text("SELECT COUNT(*) FROM organizers"))
+                assert result.scalar_one() >= 0
+
+            with engine.connect() as conn:
+                with pytest.raises(DBAPIError, match="permission denied"):
+                    conn.execute(sa_text(
+                        "INSERT INTO organizers (username, password_hash, role, is_active) "
+                        "VALUES ('sc_privilege_test_intruder', 'x', 'ORGANIZER', true)"
+                    ))
+
+            with engine.connect() as conn:
+                with pytest.raises(DBAPIError):
+                    conn.execute(sa_text("DROP TABLE organizers"))
+        finally:
+            engine.dispose()
+
+
+# --- Reverse-proxy trust configuration (Phase 3 hardening, section F) -------
+#
+# The actual production load balancer/proxy cannot be live-tested in this
+# environment — that part is deployment-time verification only (see
+# deployment.md). What CAN be tested here, and is: that
+# docker-entrypoint.sh actually translates SC_TRUSTED_PROXY_IPS into the
+# uvicorn flag that makes X-Forwarded-* trust conditional on it, and that it
+# does NOT add that flag (i.e. trusts nothing) when the variable is unset —
+# a fake `uvicorn` on PATH captures exactly what args the real one would
+# have received, without starting a real server.
+
+def _run_entrypoint_and_capture_uvicorn_args(tmp_path: Path, env: dict) -> list[str]:
+    import stat
+    import subprocess
+
+    captured = tmp_path / "captured_args.txt"
+    fake_uvicorn = tmp_path / "uvicorn"
+    fake_uvicorn.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{captured}"\n')
+    fake_uvicorn.chmod(fake_uvicorn.stat().st_mode | stat.S_IEXEC)
+
+    entrypoint = Path(__file__).resolve().parents[1] / "docker-entrypoint.sh"
+    run_env = {**os.environ, **env, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+    subprocess.run(["sh", str(entrypoint)], env=run_env, check=True, capture_output=True, text=True)
+    return captured.read_text().splitlines()
+
+
+def test_entrypoint_trusts_no_forwarded_headers_when_proxy_ips_unset(tmp_path: Path):
+    args = _run_entrypoint_and_capture_uvicorn_args(tmp_path, {"SC_TRUSTED_PROXY_IPS": ""})
+    assert "--forwarded-allow-ips" not in " ".join(args)
+    assert "--proxy-headers" not in args
+
+
+def test_entrypoint_trusts_forwarded_headers_only_from_configured_proxy(tmp_path: Path):
+    args = _run_entrypoint_and_capture_uvicorn_args(tmp_path, {"SC_TRUSTED_PROXY_IPS": "10.0.0.5"})
+    joined = " ".join(args)
+    assert "--proxy-headers" in args
+    assert "--forwarded-allow-ips=10.0.0.5" in joined
+
+
+def test_entrypoint_passes_through_multiple_trusted_proxy_cidrs(tmp_path: Path):
+    args = _run_entrypoint_and_capture_uvicorn_args(tmp_path, {"SC_TRUSTED_PROXY_IPS": "10.0.0.5,172.16.0.0/12"})
+    joined = " ".join(args)
+    assert "--forwarded-allow-ips=10.0.0.5,172.16.0.0/12" in joined

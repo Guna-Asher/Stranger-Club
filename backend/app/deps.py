@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import queue
 import secrets
@@ -12,6 +13,8 @@ from sqlalchemy.orm import Session, joinedload
 
 from .models import Match, Organizer, OrganizerSession, Payment, PaymentProof, PlayerSession, Registration, User, now_ist
 from .services import api_error, event_summary
+
+logger = logging.getLogger("stranger_club")
 
 PLATFORM_ADMIN = "PLATFORM_ADMIN"
 
@@ -72,6 +75,10 @@ def require_admin(context: tuple[Organizer, OrganizerSession] = Depends(auth_con
 
 def require_csrf(request: Request, context: tuple[Organizer, OrganizerSession] = Depends(auth_context)) -> Organizer:
     if not secrets.compare_digest(request.headers.get("X-CSRF-Token", ""), context[1].csrf_token):
+        # Never logs the token itself (valid or supplied) — only that a
+        # mismatch happened, and for whom, which is what a security review
+        # of this log actually needs.
+        logger.warning("csrf_invalid organizer_id=%s path=%s", context[0].id, request.url.path)
         raise api_error(403, "CSRF_INVALID", "Security token is invalid or expired")
     return context[0]
 
@@ -145,5 +152,6 @@ def require_player(context: tuple[User, PlayerSession] = Depends(player_auth_con
 
 def require_player_csrf(request: Request, context: tuple[User, PlayerSession] = Depends(player_auth_context)) -> User:
     if not secrets.compare_digest(request.headers.get("X-CSRF-Token", ""), context[1].csrf_token):
+        logger.warning("csrf_invalid user_id=%s path=%s", context[0].id, request.url.path)
         raise api_error(403, "CSRF_INVALID", "Security token is invalid or expired")
     return context[0]

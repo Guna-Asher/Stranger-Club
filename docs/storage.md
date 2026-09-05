@@ -104,25 +104,79 @@ holds.
 
 ## Versioning / overwrite protection
 
-**Status: evaluated, not yet enabled against a real provider account** (no
-production R2/S3 account exists in this environment to configure). What to
-do when provisioning the real bucket:
+Payment-proof evidence has three independent layers of protection. They
+are genuinely independent — a gap in one does not remove the others — and
+each is at a different level of certainty, which is deliberate:
 
-- Enable bucket versioning (R2 and S3 both support the S3 versioning API).
-  This gives a recovery path for an accidental overwrite or an
-  out-of-policy deletion, on top of the IAM restriction above — do not
-  claim this protection exists until you have actually enabled it and
-  verified with `GetBucketVersioning` that it reports `Enabled`.
-- Object Lock / retention policies are a further option if the product's
-  risk tolerance later demands protection against a compromised admin
-  credential deleting a specific version — not enabled by default, since it
-  adds real operational friction (versions must then be explicitly expired)
-  for a benefit that isn't yet justified by real incident history.
+1. **Code-enforced (verified, always true, everywhere this code runs).**
+   The `Storage` protocol has no delete method at all (see above) — no
+   application code path, including a bug, can call one. This is true in
+   every environment (local, CI, production) because it's a property of
+   the code, not of configuration.
+2. **Infrastructure configuration (must be provisioned by the operator
+   against the real account — not automatic, not yet done for a real R2/S3
+   account because none exists in this environment).**
+   - The runtime `SC_STORAGE_*` credential must be IAM-scoped with no
+     `s3:DeleteObject`/`s3:DeleteObjectVersion` on `proofs/` or `qr/`.
+   - Bucket versioning should be enabled on the production bucket.
+     `scripts/configure_bucket_protection.py` does this and — critically —
+     **never claims success without reading the status back from the
+     provider**: `enable_versioning()` calls `PutBucketVersioning` then
+     immediately calls `GetBucketVersioning` and reports the actual
+     returned status, distinguishing "provider rejected the call"
+     (`PROVIDER_REJECTED`, e.g. an endpoint that doesn't implement
+     versioning) from "enabled and confirmed" (`VERIFIED_ENABLED`) from "put
+     succeeded but the read-back didn't match" (`VERIFY_MISMATCH`). Run it
+     against the real bucket during provisioning:
+     ```bash
+     python scripts/configure_bucket_protection.py --bucket <bucket> --enable
+     ```
+   - Cloudflare R2 and AWS S3 both document support for the S3 bucket
+     versioning API as of when this was written — verify against the
+     provider's *current* documentation at setup time regardless, since
+     provider capabilities change, and treat this script's own read-back as
+     the source of truth over any documentation (including this one).
+   - Object Lock / retention policies are a further option if the
+     product's risk tolerance later demands protection against a
+     compromised admin credential deleting a specific version — not
+     enabled by default, since it adds real operational friction (locked
+     versions must then be explicitly retained/expired) for a benefit not
+     yet justified by real incident history.
+3. **Deployment-time verification (required before trusting this in a real
+   deployment).** Run `configure_bucket_protection.py --enable` against the
+   real production bucket after it's created, and confirm the printed
+   outcome is `VERIFIED_ENABLED` — not "code exists that could enable it."
 
-`scripts/reconcile_storage.py`'s report is the practical, always-on
-detection mechanism regardless of whether versioning is enabled: it
-compares every `PaymentProof.storage_key` / QR `storage_key` against what
-actually exists in the bucket and alerts on anything referenced-but-missing.
+### What was actually verified locally (MinIO), and what wasn't
+
+**Verified against a real MinIO instance in this environment** — not
+mocked, not assumed:
+- `configure_bucket_protection.py --enable` genuinely enables versioning on
+  a MinIO bucket and its read-back confirms `Enabled`
+  (`test_bucket_versioning_can_be_enabled_and_is_verified_by_readback`).
+- With versioning enabled, an object that is overwritten and then deleted
+  is still fully recoverable: `list_object_versions` returns every prior
+  version's real bytes, fetchable individually by `VersionId`, even though
+  a normal `GET` on the current key correctly reports not-found
+  (`test_versioned_bucket_recovers_overwritten_and_deleted_objects`).
+
+**Not verified, and not claimed** — requires a real provider account,
+which does not exist in this environment:
+- That Cloudflare R2 (specifically, as opposed to the generic S3 API MinIO
+  also implements) accepts and honours these same calls identically. R2's
+  S3-compatibility is generally close, but this must be re-run against a
+  real R2 bucket during provisioning before relying on it — see the
+  deployment-time step above.
+- Any cost/retention implications of enabling versioning on a real
+  provider account (stored bytes for old versions count toward storage
+  usage/cost) — review the provider's pricing for versioned storage before
+  enabling in production.
+
+`scripts/reconcile_storage.py`'s report remains the practical, always-on
+detection mechanism regardless of whether versioning is enabled or how a
+given provider implements it: it compares every `PaymentProof.storage_key`
+/ QR `storage_key` against what actually exists in the bucket and alerts on
+anything referenced-but-missing, independent of the versioning layer.
 
 ## Failure handling
 
