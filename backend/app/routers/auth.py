@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import logging
-import os
 import secrets
-import time
 from datetime import timedelta
 
 from argon2.exceptions import VerifyMismatchError
@@ -13,31 +11,54 @@ from sqlalchemy.orm import Session
 
 from ..deps import PASSWORD_HASHER, SESSION_COOKIE, SESSION_HOURS, auth_context, get_session, require_csrf, token_hash
 from ..models import Organizer, OrganizerSession, now_ist
+from ..rate_limit import RateLimitBackendError, peek_rate_limit_db, record_rate_limit_attempt_db, reset_rate_limit_db
 from ..schemas import AuthResponse, LoginRequest
 from ..services import api_error
 
 logger = logging.getLogger("stranger_club")
 router = APIRouter()
 
+LOGIN_FAILURE_LIMIT = 8
+LOGIN_FAILURE_WINDOW_SECONDS = 900
+
 
 @router.post("/api/auth/login", response_model=AuthResponse)
 def login(payload: LoginRequest, request: Request, response: Response, session: Session = Depends(get_session)):
-    client = request.client.host if request.client else "unknown"; attempts = [value for value in request.app.state.login_attempts.get(client, []) if time.time() - value < 900]
-    request.app.state.login_attempts[client] = attempts
-    if len(attempts) >= 8: raise api_error(429, "RATE_LIMITED", "Too many login attempts. Please try again later.")
+    client = request.client.host if request.client else "unknown"
+    key = f"login:{client}"
+    # Only failed attempts count toward the limit, and a successful login
+    # resets it — a legitimate organizer logging in repeatedly is never
+    # penalised, only sustained brute-forcing is. Fails CLOSED: if the
+    # limiter backend itself is unreachable, reject rather than silently
+    # allow unlimited attempts during an outage.
+    try:
+        if peek_rate_limit_db(session, key, LOGIN_FAILURE_WINDOW_SECONDS) >= LOGIN_FAILURE_LIMIT:
+            raise api_error(429, "RATE_LIMITED", "Too many login attempts. Please try again later.")
+    except RateLimitBackendError:
+        logger.error("rate_limit_backend_unavailable key=%s", key)
+        raise api_error(429, "RATE_LIMITED", "Too many login attempts. Please try again later.")
+
     organizer = session.scalar(select(Organizer).where(Organizer.username == payload.username))
     valid = False
     if organizer and organizer.is_active:
         try: valid = PASSWORD_HASHER.verify(organizer.password_hash, payload.password)
         except VerifyMismatchError: valid = False
     if not valid:
-        attempts.append(time.time()); request.app.state.login_attempts[client] = attempts
+        try:
+            record_rate_limit_attempt_db(session, key, LOGIN_FAILURE_WINDOW_SECONDS)
+        except RateLimitBackendError:
+            logger.error("rate_limit_backend_unavailable key=%s", key)
         logger.warning("login_failed remote=%s", client)
         raise api_error(401, "INVALID_CREDENTIALS", "Invalid username or password.")
+
     raw = secrets.token_urlsafe(32); csrf = secrets.token_urlsafe(24)
     session.add(OrganizerSession(token_hash=token_hash(raw), csrf_token=csrf, organizer_id=organizer.id, expires_at=now_ist() + timedelta(hours=SESSION_HOURS)))
-    session.commit(); request.app.state.login_attempts.pop(client, None)
-    response.set_cookie(SESSION_COOKIE, raw, httponly=True, secure=os.getenv("SC_COOKIE_SECURE", "false").lower() == "true", samesite="lax", max_age=SESSION_HOURS * 3600, path="/")
+    session.commit()
+    try:
+        reset_rate_limit_db(session, key)
+    except RateLimitBackendError:
+        pass  # best-effort reset; a stale counter just means slightly stricter limiting next time, not a security issue
+    response.set_cookie(SESSION_COOKIE, raw, httponly=True, secure=request.app.state.config.secure_cookies, samesite="lax", max_age=SESSION_HOURS * 3600, path="/")
     logger.info("login_succeeded organizer_id=%s", organizer.id)
     return {"organizer": {"username": organizer.username, "role": organizer.role}, "csrf_token": csrf}
 

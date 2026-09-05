@@ -4,7 +4,6 @@ import hashlib
 import os
 import queue
 import secrets
-import time
 
 from argon2 import PasswordHasher
 from fastapi import Depends, Request
@@ -51,15 +50,6 @@ class EventBroadcaster:
 
 
 def token_hash(raw: str) -> str: return hashlib.sha256(raw.encode()).hexdigest()
-
-
-def enforce_rate_limit(buckets: dict[str, list[float]], client: str, limit: int, window_seconds: int) -> None:
-    """Small in-memory sliding-window limiter shared by public, unauthenticated endpoints."""
-    attempts = [value for value in buckets.get(client, []) if time.time() - value < window_seconds]
-    if len(attempts) >= limit:
-        raise api_error(429, "RATE_LIMITED", "Too many requests. Please try again later.")
-    attempts.append(time.time())
-    buckets[client] = attempts
 
 
 def get_session(request: Request):

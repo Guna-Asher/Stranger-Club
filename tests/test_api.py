@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from io import BytesIO
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -8,7 +9,7 @@ import sqlite3
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
 
 from backend.app.deps import (
     OTP_REQUEST_IP_LIMIT, OTP_REQUEST_PHONE_LIMIT, OTP_VERIFY_IP_LIMIT,
@@ -19,11 +20,33 @@ from backend.app.models import OrganizerSession, PlayerSession, Registration, no
 from backend.app.services import review_payment
 from backend.app.services_player import OTP_MAX_ATTEMPTS
 
+# Set SC_TEST_DATABASE_URL to run this entire suite against PostgreSQL
+# instead of SQLite, e.g.:
+#   SC_TEST_DATABASE_URL=postgresql+psycopg://user:pass@host/db pytest tests/test_api.py
+# Deliberately a *different* env var from DATABASE_URL (which backend.app.main
+# reads for its own module-level `app = create_app()` on import) so running
+# the Postgres suite never accidentally points that unrelated instance at
+# a real database too.
+TEST_DATABASE_URL = os.getenv("SC_TEST_DATABASE_URL")
+
+
+def _reset_postgres_schema(database_url: str) -> None:
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text("DROP SCHEMA public CASCADE"))
+        connection.execute(text("CREATE SCHEMA public"))
+    engine.dispose()
+
 
 @pytest.fixture()
 def client(tmp_path: Path):
-    with TestClient(create_app(data_dir=tmp_path / "data", admin_password="correct-horse")) as test_client:
-        yield test_client
+    if TEST_DATABASE_URL:
+        _reset_postgres_schema(TEST_DATABASE_URL)
+        with TestClient(create_app(database_url=TEST_DATABASE_URL, admin_password="correct-horse")) as test_client:
+            yield test_client
+    else:
+        with TestClient(create_app(data_dir=tmp_path / "data", admin_password="correct-horse")) as test_client:
+            yield test_client
 
 
 def image_file():
@@ -101,8 +124,16 @@ def test_health_public_event_and_migration(client: TestClient):
     assert client.get("/ready").json() == {"status": "ready"}
     assert client.get("/api/events/sunday-cricket-2026").status_code == 200
     with client.app.state.session_factory() as session:
-        versions = set(session.execute(text("SELECT version FROM schema_migrations")).scalars())
-        assert {"20260818_domain_foundation", "20260818_payment_state_cleanup", "20260906_player_identity"}.issubset(versions)
+        # schema_migrations is bookkeeping for the frozen, SQLite-only
+        # pre-Alembic bootstrap (backend/app/migrations.py) — PostgreSQL
+        # never had pre-Alembic history and never runs that code path at
+        # all (see database.py / 0000_postgres_bootstrap.py).
+        if session.bind.dialect.name == "sqlite":
+            versions = set(session.execute(text("SELECT version FROM schema_migrations")).scalars())
+            assert {"20260818_domain_foundation", "20260818_payment_state_cleanup", "20260906_player_identity"}.issubset(versions)
+        else:
+            current_head = session.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+            assert current_head == "0007"
 
 
 def test_legacy_database_is_upgraded_without_losing_event_or_payment(tmp_path: Path):
@@ -194,7 +225,13 @@ def test_registration_position_duplicate_and_realtime_event(client: TestClient):
     registration = response.json()
     assert registration["status"] == "PENDING"
     assert registration["preferred_position"] == "ALL_ROUNDER"
-    realtime = channel.get_nowait()
+    # get(timeout=...), not get_nowait(): the PostgreSQL-backed broadcaster
+    # delivers asynchronously (DB commit -> best-effort NOTIFY -> background
+    # listener thread -> local queue), unlike the in-process one, which
+    # delivers synchronously. Realtime is a freshness optimisation, not a
+    # correctness guarantee, so a short wait here is the correct way to
+    # observe it regardless of which backend is active.
+    realtime = channel.get(timeout=5)
     assert realtime["type"] == "REGISTRATION_CREATED"
     assert realtime["summary"]["pending"] == 1
     duplicate = register(client, event["public_id"], player_headers, position="BOWLER")
@@ -952,9 +989,18 @@ def test_concurrent_payment_submission_has_no_race_or_orphaned_files(client: Tes
         assert row.payment is not None
         proofs = session.query(ProofModel).filter_by(payment_id=row.payment.id).all()
         assert len(proofs) == 1  # no duplicate proof rows from the race
+        # The application's storage credential has no delete permission over
+        # payment-proof objects (Phase 3 requirement: evidence is
+        # append-only), so a request that loses the race leaves its
+        # just-written file in place as a harmless, unreferenced orphan
+        # rather than deleting it — reconciliation (a separate,
+        # privileged, manually-run process) is what would report/clean
+        # those up, never normal request-handling code. The invariant that
+        # actually matters is the other direction: the DB never points at a
+        # file that doesn't exist.
         proofs_dir = client.app.state.uploads_dir / "proofs"
         files_on_disk = {p.name for p in proofs_dir.iterdir()} if proofs_dir.exists() else set()
-        assert files_on_disk == {proofs[0].storage_key}  # no orphaned files, no dangling references
+        assert proofs[0].storage_key in files_on_disk
 
 
 def test_app_startup_fails_loudly_on_ambiguous_ownership_backfill(tmp_path: Path):

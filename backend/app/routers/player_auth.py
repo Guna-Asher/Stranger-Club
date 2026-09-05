@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import secrets
 from datetime import timedelta
 
@@ -14,10 +13,11 @@ from sqlalchemy import select
 from ..deps import (
     OTP_REQUEST_IP_LIMIT, OTP_REQUEST_IP_WINDOW_SECONDS, OTP_REQUEST_PHONE_LIMIT,
     OTP_REQUEST_PHONE_WINDOW_SECONDS, OTP_VERIFY_IP_LIMIT, OTP_VERIFY_IP_WINDOW_SECONDS,
-    PLAYER_SESSION_COOKIE, PLAYER_SESSION_DAYS, enforce_rate_limit, get_session,
+    PLAYER_SESSION_COOKIE, PLAYER_SESSION_DAYS, get_session,
     player_auth_context, require_player, require_player_csrf, token_hash,
 )
 from ..models import PlayerProfile, PlayerSession, User, now_ist
+from ..rate_limit import enforce_rate_limit_db
 from ..schemas import OtpRequest, OtpVerify, PlayerAuthResponse, PlayerProfileResponse, PlayerProfileUpdate
 from ..services_player import request_otp, verify_otp
 
@@ -32,8 +32,8 @@ GENERIC_OTP_RESPONSE = {"status": "sent"}
 @router.post("/api/player/otp/request")
 def otp_request(payload: OtpRequest, request: Request, session: Session = Depends(get_session)):
     client = request.client.host if request.client else "unknown"
-    enforce_rate_limit(request.app.state.otp_request_ip_attempts, client, OTP_REQUEST_IP_LIMIT, OTP_REQUEST_IP_WINDOW_SECONDS)
-    enforce_rate_limit(request.app.state.otp_request_phone_attempts, payload.phone, OTP_REQUEST_PHONE_LIMIT, OTP_REQUEST_PHONE_WINDOW_SECONDS)
+    enforce_rate_limit_db(session, f"otp_request_ip:{client}", OTP_REQUEST_IP_LIMIT, OTP_REQUEST_IP_WINDOW_SECONDS)
+    enforce_rate_limit_db(session, f"otp_request_phone:{payload.phone}", OTP_REQUEST_PHONE_LIMIT, OTP_REQUEST_PHONE_WINDOW_SECONDS)
     request_otp(session, payload.phone, request.app.state.otp_provider)
     return GENERIC_OTP_RESPONSE
 
@@ -41,7 +41,7 @@ def otp_request(payload: OtpRequest, request: Request, session: Session = Depend
 @router.post("/api/player/otp/verify", response_model=PlayerAuthResponse)
 def otp_verify(payload: OtpVerify, request: Request, response: Response, session: Session = Depends(get_session)):
     client = request.client.host if request.client else "unknown"
-    enforce_rate_limit(request.app.state.otp_verify_ip_attempts, client, OTP_VERIFY_IP_LIMIT, OTP_VERIFY_IP_WINDOW_SECONDS)
+    enforce_rate_limit_db(session, f"otp_verify_ip:{client}", OTP_VERIFY_IP_LIMIT, OTP_VERIFY_IP_WINDOW_SECONDS)
     user = verify_otp(session, payload.phone, payload.code)
 
     # Session rotation: replace whatever session cookie the browser already
@@ -55,7 +55,7 @@ def otp_verify(payload: OtpVerify, request: Request, response: Response, session
     session.commit()
     response.set_cookie(
         PLAYER_SESSION_COOKIE, raw, httponly=True,
-        secure=os.getenv("SC_COOKIE_SECURE", "false").lower() == "true",
+        secure=request.app.state.config.secure_cookies,
         samesite="lax", max_age=PLAYER_SESSION_DAYS * 86400, path="/",
     )
     return {"phone": user.phone, "csrf_token": csrf}

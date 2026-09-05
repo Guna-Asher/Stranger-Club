@@ -29,7 +29,17 @@ def run_migrations_offline() -> None:
 def run_migrations_online() -> None:
     connectable = engine_from_config(config.get_section(config.config_ini_section, {}), prefix="sqlalchemy.", poolclass=pool.NullPool)
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata, render_as_batch=True)
+        # Batch mode (recreate-the-table) is a SQLite-only workaround for its
+        # limited ALTER TABLE support. PostgreSQL supports ALTER TABLE
+        # directly — forcing batch mode there would recreate tables
+        # unnecessarily and risk subtly mishandling sequences/identity
+        # columns during the copy. Every existing migration already uses
+        # op.batch_alter_table(), which is a correct direct ALTER on any
+        # dialect where render_as_batch is False.
+        context.configure(
+            connection=connection, target_metadata=target_metadata,
+            render_as_batch=(connection.dialect.name == "sqlite"),
+        )
         with context.begin_transaction():
             context.run_migrations()
 

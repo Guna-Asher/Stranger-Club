@@ -134,11 +134,20 @@ def upgrade() -> None:
     now = bind.execute(sa.text("SELECT CURRENT_TIMESTAMP")).scalar_one()
     an_organizer_id = bind.execute(sa.text("SELECT id FROM organizers ORDER BY id LIMIT 1")).scalar_one_or_none()
 
-    matches_without_config = bind.execute(sa.text("""
-        SELECT m.id, m.upi_id FROM matches m
-        LEFT JOIN event_payment_configurations c ON c.match_id = m.id
-        WHERE c.id IS NULL
-    """)).mappings().all()
+    # matches.upi_id only exists on a database that already went through the
+    # pre-Phase-2C schema (i.e. it predates this very migration). A database
+    # bootstrapped directly from the current models (see
+    # 0000_postgres_bootstrap.py) never had that column at all — and, being
+    # freshly bootstrapped, has no pre-existing Match rows to backfill
+    # either, so there is nothing to do.
+    if _has_column(bind, "matches", "upi_id"):
+        matches_without_config = bind.execute(sa.text("""
+            SELECT m.id, m.upi_id FROM matches m
+            LEFT JOIN event_payment_configurations c ON c.match_id = m.id
+            WHERE c.id IS NULL
+        """)).mappings().all()
+    else:
+        matches_without_config = []
     configs_created = 0
     for row in matches_without_config:
         bind.execute(sa.text("""
@@ -196,19 +205,27 @@ def upgrade() -> None:
     # PaymentProof, IF the file still exists. A missing file is logged and
     # skipped, never fabricated, and never treated as a reason to refuse to
     # start the application over one historically lost file.
-    data_dir = os.getenv("SC_DATA_DIR", "data")
-    legacy_uploads_dir = os.path.join(data_dir, "uploads")
-    proofs_uploads_dir = os.path.join(data_dir, "uploads", "proofs")
-    os.makedirs(proofs_uploads_dir, exist_ok=True)
-
-    payments_with_screenshots = bind.execute(sa.text("""
-        SELECT p.id AS payment_id, p.screenshot_path, p.status, p.submitted_at, p.verified_at, r.user_id
-        FROM payments p JOIN registrations r ON r.id = p.registration_id
-        WHERE p.screenshot_path IS NOT NULL
-    """)).mappings().all()
+    #
+    # payments.screenshot_path only exists on a database that already went
+    # through the pre-Phase-2C schema — same reasoning as matches.upi_id
+    # above. A freshly bootstrapped database never had it and has no
+    # pre-existing Payment rows either.
     proofs_created = 0
     proofs_skipped_missing_file = 0
     proofs_skipped_no_user = 0
+    if _has_column(bind, "payments", "screenshot_path"):
+        data_dir = os.getenv("SC_DATA_DIR", "data")
+        legacy_uploads_dir = os.path.join(data_dir, "uploads")
+        proofs_uploads_dir = os.path.join(data_dir, "uploads", "proofs")
+        os.makedirs(proofs_uploads_dir, exist_ok=True)
+
+        payments_with_screenshots = bind.execute(sa.text("""
+            SELECT p.id AS payment_id, p.screenshot_path, p.status, p.submitted_at, p.verified_at, r.user_id
+            FROM payments p JOIN registrations r ON r.id = p.registration_id
+            WHERE p.screenshot_path IS NOT NULL
+        """)).mappings().all()
+    else:
+        payments_with_screenshots = []
     for row in payments_with_screenshots:
         source_path = os.path.join(legacy_uploads_dir, row["screenshot_path"])
         if not os.path.isfile(source_path):
@@ -248,16 +265,23 @@ def upgrade() -> None:
     )
 
     has_screenshot_token_index = any(ix["name"] == "ix_payments_screenshot_token" for ix in inspect(bind).get_indexes("payments"))
+    existing_payment_checks = {cc["name"] for cc in inspect(bind).get_check_constraints("payments")}
     with op.batch_alter_table("payments") as batch_op:
         batch_op.alter_column("amount_due", existing_type=sa.Integer(), nullable=False)
         batch_op.alter_column("payee_upi_id_snapshot", existing_type=sa.String(120), nullable=False)
         batch_op.alter_column("payee_name_snapshot", existing_type=sa.String(80), nullable=False)
         batch_op.alter_column("qr_source_snapshot", existing_type=sa.String(20), nullable=False)
-        batch_op.create_check_constraint("ck_payment_status_valid", "status IN ('AWAITING_PROOF','SUBMITTED','VERIFIED','REJECTED')")
-        batch_op.create_check_constraint(
-            "ck_payment_qr_snapshot_consistent",
-            "(qr_source_snapshot = 'UPLOADED' AND qr_storage_key_snapshot IS NOT NULL) OR (qr_source_snapshot = 'GENERATED' AND qr_storage_key_snapshot IS NULL)",
-        )
+        # A database bootstrapped directly from the current models (see
+        # 0000_postgres_bootstrap.py) already has both check constraints —
+        # they're declared directly in the Payment model's __table_args__ —
+        # so creating them again here would collide.
+        if "ck_payment_status_valid" not in existing_payment_checks:
+            batch_op.create_check_constraint("ck_payment_status_valid", "status IN ('AWAITING_PROOF','SUBMITTED','VERIFIED','REJECTED')")
+        if "ck_payment_qr_snapshot_consistent" not in existing_payment_checks:
+            batch_op.create_check_constraint(
+                "ck_payment_qr_snapshot_consistent",
+                "(qr_source_snapshot = 'UPLOADED' AND qr_storage_key_snapshot IS NOT NULL) OR (qr_source_snapshot = 'GENERATED' AND qr_storage_key_snapshot IS NULL)",
+            )
         # The unique index backing the old screenshot_token column must be
         # dropped explicitly before the column itself — SQLite batch mode
         # does not infer that an index becomes invalid when its column goes.

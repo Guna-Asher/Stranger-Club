@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, joinedload
 from ..deps import get_session
 from ..models import Match
 from ..schemas import EventSummary, MatchResponse
-from ..services import event_summary, get_public_match, match_to_response
+from ..services import api_error, event_summary, get_public_match, match_to_response
 
 router = APIRouter()
 
@@ -33,6 +33,8 @@ def public_summary(public_id: str, session: Session = Depends(get_session)): ret
 @router.get("/api/events/{public_id}/stream")
 def event_stream(public_id: str, request: Request, session: Session = Depends(get_session)):
     initial_summary = event_summary(session, get_public_match(session, public_id)); channel = request.app.state.broadcaster.subscribe(public_id)
+    if channel is None:
+        raise api_error(503, "TOO_MANY_STREAMS", "Live updates are temporarily at capacity. The page still works — just refresh for the latest status.")
     def stream():
         try:
             yield f"event: summary\ndata: {json.dumps(initial_summary, default=str)}\n\n"

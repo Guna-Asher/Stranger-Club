@@ -32,7 +32,16 @@ export default function PlayerApp({ publicId }) {
     } catch (err) { setError(err.message); }
   };
   useEffect(() => { load(); }, [publicId]);
-  useEffect(() => { const stream = new EventSource(`/api/events/${publicId}/stream`); stream.onmessage = () => load(); stream.addEventListener('summary', () => load()); return () => stream.close(); }, [publicId]);
+  useEffect(() => {
+    const stream = new EventSource(`/api/events/${publicId}/stream`);
+    stream.onmessage = () => load();
+    stream.addEventListener('summary', () => load());
+    // Emitted by the backend after its realtime listener reconnects (e.g.
+    // after a brief database blip) — some updates may have been missed
+    // during the gap, so refetch rather than trust the stream was complete.
+    stream.addEventListener('RESYNC', () => load());
+    return () => stream.close();
+  }, [publicId]);
   const save = (item) => { setRegistration(item); localStorage.setItem(key, item.public_id); };
   if (error) return <ErrorPage message={error} />;
   if (!match) return <Loading />;

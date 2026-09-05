@@ -6,7 +6,13 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import (
     Boolean, CheckConstraint, Date, DateTime, ForeignKey, Index, Integer, JSON, String, Text, Time, text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+# JSONB on PostgreSQL (indexable/queryable), plain JSON elsewhere (SQLite).
+# See alembic/versions/0006_jsonb_audit_columns.py for the migration that
+# aligns an existing PostgreSQL database's column type with this.
+JSONVariant = JSON().with_variant(JSONB(), "postgresql")
 
 # Registration statuses considered "active" for the purposes of the one-active-
 # registration-per-user-per-event invariant. REJECTED is deliberately included:
@@ -282,14 +288,25 @@ class AuditLog(Base):
     event_type: Mapped[str] = mapped_column(String(80), index=True)
     entity_type: Mapped[str] = mapped_column(String(80))
     entity_id: Mapped[str] = mapped_column(String(80))
-    metadata_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    metadata_json: Mapped[dict | None] = mapped_column(JSONVariant, nullable=True)
     # Attribution, added in Phase 2B. Nullable because historical rows (and a
     # small number of system-initiated events) may not have an actor.
     actor_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     actor_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    before_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    after_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    before_json: Mapped[dict | None] = mapped_column(JSONVariant, nullable=True)
+    after_json: Mapped[dict | None] = mapped_column(JSONVariant, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
+
+
+class RateLimitBucket(Base):
+    """Backs the distributed rate limiter (backend/app/rate_limit.py). One
+    fixed-window counter per limiter key, shared across every application
+    instance via PostgreSQL — see 0007_rate_limit_buckets.py."""
+    __tablename__ = "rate_limit_buckets"
+
+    key: Mapped[str] = mapped_column(String(200), primary_key=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
 
 class User(Base):

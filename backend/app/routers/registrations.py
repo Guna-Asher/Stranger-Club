@@ -5,10 +5,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
 from ..deps import (
-    REGISTRATION_RATE_LIMIT, REGISTRATION_RATE_WINDOW_SECONDS, enforce_rate_limit, get_session,
+    REGISTRATION_RATE_LIMIT, REGISTRATION_RATE_WINDOW_SECONDS, get_session,
     publish_event_update, require_player, require_player_csrf,
 )
 from ..models import Registration, User
+from ..rate_limit import enforce_rate_limit_db
 from ..schemas import RegistrationCreate, RegistrationResponse
 from ..services import api_error, assert_registration_owner, cancel_registration, create_registration, get_public_match, registration_to_response
 
@@ -19,7 +20,7 @@ router = APIRouter()
 @router.post("/api/matches/{public_id}/registrations", response_model=RegistrationResponse, status_code=201)
 def register(public_id: str, payload: RegistrationCreate, request: Request, session: Session = Depends(get_session), player: User = Depends(require_player_csrf)):
     client = request.client.host if request.client else "unknown"
-    enforce_rate_limit(request.app.state.registration_attempts, client, REGISTRATION_RATE_LIMIT, REGISTRATION_RATE_WINDOW_SECONDS)
+    enforce_rate_limit_db(session, f"registration:{client}", REGISTRATION_RATE_LIMIT, REGISTRATION_RATE_WINDOW_SECONDS)
     registration = create_registration(session, get_public_match(session, public_id), payload, player); publish_event_update(request, session, registration.match_id, "REGISTRATION_CREATED"); return registration_to_response(registration)
 
 

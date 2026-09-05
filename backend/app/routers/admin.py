@@ -14,10 +14,11 @@ from ..schemas import (
     PaymentConfigurationUpdate, RegistrationResponse, RejectRequest,
 )
 from ..services import (
-    PAYMENT_SUBMITTED, cancel_registration, create_match, event_summary, match_to_response,
+    PAYMENT_SUBMITTED, api_error, cancel_registration, create_match, event_summary, match_to_response,
     payment_configuration_to_response, promote_waitlisted, registration_to_response, review_payment,
     set_payment_configuration_qr, update_match, update_payment_configuration,
 )
+from ..storage import StorageUnavailableError
 
 router = APIRouter()
 
@@ -66,7 +67,10 @@ async def admin_upload_payment_qr(
     request: Request, qr_image: UploadFile = File(...), match: Match = Depends(require_event_access),
     organizer: Organizer = Depends(require_csrf), session: Session = Depends(get_session),
 ):
-    config = await set_payment_configuration_qr(session, match, qr_image, request.app.state.qr_storage, organizer)
+    try:
+        config = await set_payment_configuration_qr(session, match, qr_image, request.app.state.qr_storage, organizer)
+    except StorageUnavailableError:
+        raise api_error(503, "STORAGE_UNAVAILABLE", "Upload service is temporarily unavailable. Please try again.")
     return payment_configuration_to_response(config)
 
 

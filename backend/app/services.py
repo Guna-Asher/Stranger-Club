@@ -80,6 +80,31 @@ def api_error(status_code: int, code: str, message: str) -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": message})
 
 
+def begin_serialized_write(session: Session) -> None:
+    """Starts the transaction a subsequent row lock will serialize against.
+    SQLite: BEGIN IMMEDIATE takes a whole-database write lock up front (the
+    original mechanism, unchanged). PostgreSQL: nothing to do here — the
+    actual lock comes from lock_row() below, scoped to one specific row
+    rather than the whole database."""
+    session.rollback()
+    if session.bind.dialect.name == "sqlite":
+        session.execute(text("BEGIN IMMEDIATE"))
+
+
+def lock_row(session: Session, model, id_: int) -> None:
+    """PostgreSQL row-level lock for the duration of the current transaction.
+    Deliberately a bare `SELECT id ... FOR UPDATE` with no joins: PostgreSQL
+    rejects FOR UPDATE combined with the outer joins joinedload() produces
+    for collection relationships ("FOR UPDATE cannot be applied to the
+    nullable side of an outer join"). Lock the single row first, then load
+    the full eager-loaded object graph in a separate, plain read within the
+    same transaction — it sees the now-locked, up-to-date row.
+    On SQLite this is a no-op: begin_serialized_write() already took a
+    whole-database write lock before this is ever called."""
+    if session.bind.dialect.name == "postgresql":
+        session.execute(select(model.id).where(model.id == id_).with_for_update())
+
+
 def audit(
     session: Session, event_type: str, entity_type: str, entity_id: int | str, metadata: dict | None = None,
     *, actor_type: str | None = None, actor_id: int | None = None, before: dict | None = None, after: dict | None = None,
@@ -376,13 +401,14 @@ def assert_registration_owner(registration: Registration, user_id: int) -> None:
 def create_registration(session: Session, match: Match, payload: RegistrationCreate, user: User) -> Registration:
     if match.registration_deadline < now_ist() or match.status not in {"OPEN", "FULL"}:
         raise api_error(409, "REGISTRATION_CLOSED", "Registration for this event has closed")
-    # SQLite BEGIN IMMEDIATE serialises the capacity decision. PostgreSQL can
-    # replace this with SELECT ... FOR UPDATE without changing this service API.
-    # The database-level partial unique index (uq_registration_active_per_user)
-    # is the final backstop even if this serialisation had a bug: a second
-    # concurrent active registration for the same (event, user) can never be
-    # written, full stop.
-    session.rollback(); session.execute(text("BEGIN IMMEDIATE"))
+    # Serialises the capacity decision — a whole-database lock on SQLite, a
+    # single Match row lock on PostgreSQL (see lock_row). The database-level
+    # partial unique index (uq_registration_active_per_user) is the final
+    # backstop even if this serialisation had a bug: a second concurrent
+    # active registration for the same (event, user) can never be written,
+    # full stop.
+    begin_serialized_write(session)
+    lock_row(session, Match, match.id)
     match = session.scalar(select(Match).options(joinedload(Match.payment_configuration)).where(Match.id == match.id))
     config = match.payment_configuration
     if not config:
@@ -425,7 +451,8 @@ def cancel_registration(session: Session, registration_id: int, *, actor_type: s
     retry, or timeout+retry). CANCELLED is terminal — this never reactivates
     or reuses a row; a player who wants back in registers again, which
     create_registration turns into a brand-new historical record."""
-    session.rollback(); session.execute(text("BEGIN IMMEDIATE"))
+    begin_serialized_write(session)
+    lock_row(session, Registration, registration_id)
     registration = session.scalar(select(Registration).options(joinedload(Registration.match)).where(Registration.id == registration_id))
     if not registration:
         raise api_error(404, "RESOURCE_NOT_FOUND", "Registration not found")
@@ -483,8 +510,9 @@ def persist_image(storage: Storage, content: bytes, image_format: str) -> str:
     """Generates an opaque storage key (never derived from user input) and
     writes the bytes. No filename, path, or extension the caller supplied is
     ever used — this is what makes path traversal structurally impossible."""
-    key = f"{uuid.uuid4().hex}{ALLOWED_FORMATS[image_format][0]}"
-    storage.put(key, content)
+    extension, content_type = ALLOWED_FORMATS[image_format]
+    key = f"{uuid.uuid4().hex}{extension}"
+    storage.put(key, content, content_type)
     return key
 
 
@@ -537,7 +565,8 @@ async def submit_payment_proof(session: Session, registration_key: str, upload: 
 
     key = persist_image(storage, content, image_format)
 
-    session.rollback(); session.execute(text("BEGIN IMMEDIATE"))
+    begin_serialized_write(session)
+    lock_row(session, Payment, payment.id)
     registration = _load_registration_for_payment(session, registration_key)
     payment = registration.payment
     try:
@@ -546,11 +575,19 @@ async def submit_payment_proof(session: Session, registration_key: str, upload: 
             raise api_error(409, "PAYMENT_ALREADY_VERIFIED", "This registration is already confirmed")
         existing_pending = next((p for p in payment.proofs if p.status == PROOF_PENDING), None)
         if existing_pending and existing_pending.submitted_by_user_id == user_id and existing_pending.screenshot_hash == digest:
-            storage.delete(key)  # this exact upload already exists as the pending proof; nothing new to keep
+            # This exact upload already exists as the pending proof — nothing
+            # new to keep. The object just written under `key` is left in
+            # place, unreferenced: the application's storage credential has
+            # no delete permission over payment-proof objects (evidence is
+            # append-only), so this harmless orphan is left for the
+            # exceptional, separately-credentialed reconciliation process
+            # (scripts/reconcile_storage.py) to report, never for normal
+            # request-handling code to clean up itself.
             session.commit()
             return registration
     except HTTPException:
-        storage.delete(key)  # avoid leaving an orphaned file behind
+        # Lost the race — `key` is an orphaned object, same reasoning as
+        # above: never deleted by this code path.
         raise
 
     if existing_pending:
@@ -593,7 +630,8 @@ def review_payment(session: Session, payment_id: int, approve: bool, *, actor_id
     uq_payment_proof_one_pending); a SUBMITTED payment with none would be a
     data-integrity bug, not a normal 409, so it raises rather than guessing
     which proof to act on."""
-    session.rollback(); session.execute(text("BEGIN IMMEDIATE"))
+    begin_serialized_write(session)
+    lock_row(session, Payment, payment_id)
     payment = session.scalar(
         select(Payment).options(joinedload(Payment.registration).joinedload(Registration.match), joinedload(Payment.proofs))
         .where(Payment.id == payment_id)
@@ -628,7 +666,8 @@ def review_payment(session: Session, payment_id: int, approve: bool, *, actor_id
 
 
 def promote_waitlisted(session: Session, registration_id: int, *, actor_id: int) -> Registration:
-    session.rollback(); session.execute(text("BEGIN IMMEDIATE"))
+    begin_serialized_write(session)
+    lock_row(session, Registration, registration_id)
     registration = session.scalar(select(Registration).options(joinedload(Registration.match), joinedload(Registration.payment)).where(Registration.id == registration_id))
     if not registration: raise api_error(404, "RESOURCE_NOT_FOUND", "Registration not found")
     if registration.status != WAITLISTED: raise api_error(409, "INVALID_STATE_TRANSITION", "Only waitlisted players can be promoted")
