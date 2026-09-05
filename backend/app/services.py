@@ -10,14 +10,18 @@ from pathlib import Path
 
 from fastapi import HTTPException, UploadFile
 from PIL import Image, UnidentifiedImageError
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from .models import (
-    AuditLog, EventPaymentConfiguration, Match, Organizer, Payment, PaymentProof, Registration, User, now_ist,
+    AuditLog, EventPaymentConfiguration, Fixture, FIXTURE_ROSTER_LOCKING_STATUSES, Match, Organizer, Payment,
+    PaymentProof, Registration, Team, TeamMember, User, now_ist,
 )
-from .schemas import EventUpdate, MatchCreate, PaymentConfigurationUpdate, RegistrationCreate
+from .schemas import (
+    EventUpdate, FixtureCreate, FixtureUpdate, MatchCreate, PaymentConfigurationUpdate, RegistrationCreate,
+    TeamCreate, TeamUpdate,
+)
 from .storage import Storage
 
 logger = logging.getLogger("stranger_club")
@@ -74,6 +78,15 @@ VALID_REGISTRATION_TRANSITIONS = {
 # Once an event is ONGOING, COMPLETED, or itself CANCELLED, there is nothing
 # for a registration-level cancellation to accomplish.
 CANCELLABLE_EVENT_STATUSES = {"DRAFT", "OPEN", "FULL"}
+# Forward-only, same reasoning as VALID_EVENT_TRANSITIONS: no COMPLETED ->
+# SCHEDULED or other reverse transition. "Fixture" is an internal name only
+# (see models.Fixture) — every user-facing string says "Match"/"Matches".
+VALID_FIXTURE_TRANSITIONS = {
+    "SCHEDULED": {"IN_PROGRESS", "CANCELLED"},
+    "IN_PROGRESS": {"COMPLETED", "CANCELLED"},
+    "COMPLETED": set(),
+    "CANCELLED": set(),
+}
 
 
 def api_error(status_code: int, code: str, message: str) -> HTTPException:
@@ -467,6 +480,18 @@ def cancel_registration(session: Session, registration_id: int, *, actor_type: s
         actor_type=actor_type, actor_id=actor_id, metadata={"event_id": registration.match_id},
     )
     registration.cancelled_at = now_ist()
+    # A cancelled registration is no longer a valid participant — it must
+    # come off any team it was on, regardless of that team's roster-lock
+    # state (see _assert_roster_unlocked): the team already played with this
+    # person on it, if it played at all, and that fact is untouched here —
+    # this only prevents the *now-cancelled* player from still appearing on
+    # a live/future roster.
+    member = session.scalar(select(TeamMember).where(TeamMember.registration_id == registration.id))
+    if member:
+        _delete_team_membership(
+            session, member, event_type="TEAM_MEMBER_REMOVED",
+            actor_type=actor_type, actor_id=actor_id, reason="registration_cancelled",
+        )
     _refresh_full_status(session, registration.match)
     session.commit(); session.refresh(registration)
     logger.info("registration_cancelled registration_id=%s actor_type=%s", registration.id, actor_type)
@@ -679,6 +704,332 @@ def promote_waitlisted(session: Session, registration_id: int, *, actor_id: int)
     _refresh_full_status(session, registration.match)
     session.commit(); session.refresh(registration)
     return registration
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Teams and Matches. "Fixture" is an internal name only, chosen to
+# avoid colliding with the Match class above (which is actually the Event
+# entity) — every user-facing string says "Match"/"Matches" (see
+# routers/fixtures.py and the frontend). No results/stats/media here — see
+# the Phase 4 plan's "Forward compatibility" section for why Fixture.id and
+# the roster-lock rule below are enough to support those later without a
+# redesign.
+# ---------------------------------------------------------------------------
+
+def _team_has_locking_fixture(session: Session, team_id: int) -> bool:
+    return bool(session.scalar(
+        select(func.count(Fixture.id)).where(
+            or_(Fixture.team_a_id == team_id, Fixture.team_b_id == team_id),
+            Fixture.status.in_(FIXTURE_ROSTER_LOCKING_STATUSES),
+        )
+    ))
+
+
+def _assert_roster_unlocked(session: Session, team_id: int) -> None:
+    """A team's roster freezes the moment any of its fixtures reaches
+    IN_PROGRESS or COMPLETED — see models.TeamMember's docstring. This is
+    the one check that makes "who was on Team A when it played" a durable
+    fact without a per-fixture roster snapshot table."""
+    if _team_has_locking_fixture(session, team_id):
+        raise api_error(409, "TEAM_ROSTER_LOCKED", "This team has already played a match; its roster can no longer be changed")
+
+
+def team_member_count(session: Session, team_id: int) -> int:
+    return session.scalar(select(func.count(TeamMember.id)).where(TeamMember.team_id == team_id)) or 0
+
+
+def team_to_response(session: Session, team: Team) -> dict:
+    return {
+        "id": team.id, "event_id": team.event_id, "name": team.name, "short_code": team.short_code,
+        "max_size": team.max_size, "member_count": team_member_count(session, team.id),
+        "created_at": team.created_at, "updated_at": team.updated_at,
+    }
+
+
+def team_member_to_response(member: TeamMember) -> dict:
+    registration = member.registration
+    return {
+        "id": member.id, "team_id": member.team_id, "registration_id": member.registration_id,
+        "player_name": registration.name, "preferred_position": registration.preferred_position or "NO_PREFERENCE",
+        "assigned_position": registration.assigned_position, "created_at": member.created_at,
+    }
+
+
+def team_roster_response(session: Session, team: Team) -> dict:
+    members = session.scalars(
+        select(TeamMember).options(joinedload(TeamMember.registration))
+        .where(TeamMember.team_id == team.id).order_by(TeamMember.created_at)
+    ).all()
+    data = team_to_response(session, team)
+    data["members"] = [team_member_to_response(m) for m in members]
+    return data
+
+
+def create_team(session: Session, match: Match, payload: TeamCreate, organizer: Organizer) -> Team:
+    if match.status == "CANCELLED":
+        raise api_error(409, "EVENT_CANCELLED", "Cannot create teams for a cancelled event")
+    team = Team(event_id=match.id, name=payload.name, short_code=payload.short_code, max_size=payload.max_size)
+    session.add(team)
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        raise api_error(409, "TEAM_NAME_TAKEN", "A team with this name already exists for this event")
+    audit(session, "TEAM_CREATED", "team", team.id, {"event_id": match.id, "name": team.name}, actor_type="ORGANIZER", actor_id=organizer.id)
+    session.commit(); session.refresh(team)
+    logger.info("team_created team_id=%s event_id=%s", team.id, match.id)
+    return team
+
+
+def update_team(session: Session, team: Team, payload: TeamUpdate, organizer: Organizer) -> Team:
+    changes = payload.model_dump(exclude_unset=True)
+    before = {"name": team.name, "short_code": team.short_code, "max_size": team.max_size}
+    for field, value in changes.items():
+        setattr(team, field, value)
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        raise api_error(409, "TEAM_NAME_TAKEN", "A team with this name already exists for this event")
+    audit(
+        session, "TEAM_UPDATED", "team", team.id, {"fields": sorted(changes)},
+        actor_type="ORGANIZER", actor_id=organizer.id, before=before, after=changes,
+    )
+    session.commit(); session.refresh(team)
+    return team
+
+
+def delete_team(session: Session, team: Team, organizer: Organizer) -> None:
+    """Removing a team is only safe when it has never appeared in a match —
+    otherwise the match's team reference would dangle, destroying history
+    (see the Phase 4 plan's match invariants). Current members are cascaded
+    (ORM cascade="all, delete-orphan" on Team.members) — safe here precisely
+    *because* no fixture exists, so no roster-lock question arises."""
+    has_fixture = bool(session.scalar(
+        select(func.count(Fixture.id)).where(or_(Fixture.team_a_id == team.id, Fixture.team_b_id == team.id))
+    ))
+    if has_fixture:
+        raise api_error(409, "TEAM_HAS_MATCHES", "Remove this team's matches before deleting it")
+    audit(
+        session, "TEAM_REMOVED", "team", team.id, {"event_id": team.event_id, "name": team.name},
+        actor_type="ORGANIZER", actor_id=organizer.id,
+    )
+    session.delete(team)
+    session.commit()
+
+
+def _delete_team_membership(
+    session: Session, member: TeamMember, *, event_type: str, actor_type: str, actor_id: int | None, reason: str | None = None,
+) -> None:
+    metadata = {"team_id": member.team_id, "registration_id": member.registration_id}
+    if reason:
+        metadata["reason"] = reason
+    audit(session, event_type, "team_member", member.id, metadata, actor_type=actor_type, actor_id=actor_id)
+    session.delete(member)
+    session.flush()
+
+
+def assign_team_member(session: Session, team: Team, registration: Registration, organizer: Organizer) -> TeamMember:
+    """Assigns a CONFIRMED registration to a team in the same event. Locked
+    on the Team row (not Registration): the invariant this protects —
+    capacity, and "not already on a team" — is fundamentally about the team's
+    current membership set, exactly the same reasoning create_registration
+    uses for locking Match rather than the incoming Registration."""
+    if registration.match_id != team.event_id:
+        raise api_error(409, "CROSS_EVENT_REGISTRATION", "This registration does not belong to this event")
+    begin_serialized_write(session)
+    lock_row(session, Team, team.id)
+    team = session.get(Team, team.id)
+    registration = session.get(Registration, registration.id)
+    if registration.status != CONFIRMED:
+        raise api_error(409, "REGISTRATION_NOT_CONFIRMED", "Only confirmed players can be assigned to a team")
+    _assert_roster_unlocked(session, team.id)
+    if team.max_size is not None and team_member_count(session, team.id) >= team.max_size:
+        raise api_error(409, "TEAM_FULL", "This team is already at capacity")
+    member = TeamMember(team_id=team.id, registration_id=registration.id, event_id=team.event_id, assigned_by_organizer_id=organizer.id)
+    session.add(member)
+    try:
+        session.flush()
+    except IntegrityError:
+        # The DB's own backstop — uq_team_member_registration — catching a
+        # race this lock should already have prevented (two organizer tabs
+        # assigning the same player at once).
+        session.rollback()
+        raise api_error(409, "ALREADY_ON_A_TEAM", "This player is already assigned to a team for this event")
+    audit(
+        session, "TEAM_MEMBER_ASSIGNED", "team_member", member.id, {"team_id": team.id, "registration_id": registration.id},
+        actor_type="ORGANIZER", actor_id=organizer.id,
+    )
+    session.commit(); session.refresh(member)
+    logger.info("team_member_assigned team_id=%s registration_id=%s", team.id, registration.id)
+    return member
+
+
+def move_team_member(session: Session, member: TeamMember, new_team: Team, organizer: Organizer) -> TeamMember:
+    if new_team.event_id != member.event_id:
+        raise api_error(409, "CROSS_EVENT_TEAM", "Cannot move a player to a team from a different event")
+    old_team_id = member.team_id
+    if old_team_id == new_team.id:
+        return member
+    # Lock both team rows in ascending id order — the one place this phase
+    # takes two row locks at once. A fixed, deterministic order across every
+    # caller is what prevents two concurrent "swap A<->B" moves from
+    # deadlocking on PostgreSQL.
+    first_id, second_id = sorted((old_team_id, new_team.id))
+    begin_serialized_write(session)
+    lock_row(session, Team, first_id)
+    lock_row(session, Team, second_id)
+    member = session.get(TeamMember, member.id)
+    new_team = session.get(Team, new_team.id)
+    _assert_roster_unlocked(session, old_team_id)
+    _assert_roster_unlocked(session, new_team.id)
+    if new_team.max_size is not None and team_member_count(session, new_team.id) >= new_team.max_size:
+        raise api_error(409, "TEAM_FULL", "The destination team is already at capacity")
+    before = {"team_id": old_team_id}
+    member.team_id = new_team.id
+    session.flush()
+    audit(
+        session, "TEAM_MEMBER_MOVED", "team_member", member.id, {"from_team_id": old_team_id, "to_team_id": new_team.id},
+        actor_type="ORGANIZER", actor_id=organizer.id, before=before, after={"team_id": new_team.id},
+    )
+    session.commit(); session.refresh(member)
+    return member
+
+
+def remove_team_member(session: Session, member: TeamMember, organizer: Organizer) -> None:
+    _assert_roster_unlocked(session, member.team_id)
+    _delete_team_membership(session, member, event_type="TEAM_MEMBER_REMOVED", actor_type="ORGANIZER", actor_id=organizer.id)
+    session.commit()
+
+
+def _load_team_in_event_or_422(session: Session, team_id: int, event_id: int) -> Team:
+    team = session.get(Team, team_id)
+    if not team or team.event_id != event_id:
+        raise api_error(422, "VALIDATION_ERROR", "Team does not belong to this event")
+    return team
+
+
+def create_fixture(session: Session, match: Match, payload: FixtureCreate, organizer: Organizer) -> Fixture:
+    if match.status == "CANCELLED":
+        raise api_error(409, "EVENT_CANCELLED", "Cannot create matches for a cancelled event")
+    _load_team_in_event_or_422(session, payload.team_a_id, match.id)
+    _load_team_in_event_or_422(session, payload.team_b_id, match.id)
+    fixture = Fixture(
+        event_id=match.id, team_a_id=payload.team_a_id, team_b_id=payload.team_b_id, sequence=payload.sequence,
+        scheduled_at=payload.scheduled_at, venue_override=payload.venue_override,
+    )
+    session.add(fixture)
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        raise api_error(409, "FIXTURE_SEQUENCE_TAKEN", "A match with this number already exists for this event")
+    audit(
+        session, "FIXTURE_CREATED", "fixture", fixture.id,
+        {"event_id": match.id, "team_a_id": fixture.team_a_id, "team_b_id": fixture.team_b_id},
+        actor_type="ORGANIZER", actor_id=organizer.id,
+    )
+    session.commit(); session.refresh(fixture)
+    logger.info("fixture_created fixture_id=%s event_id=%s", fixture.id, match.id)
+    return fixture
+
+
+def update_fixture(session: Session, fixture: Fixture, payload: FixtureUpdate, organizer: Organizer) -> Fixture:
+    """Team/time/sequence/venue can only change while SCHEDULED ("edit
+    before it starts"); once IN_PROGRESS/COMPLETED/CANCELLED, only a further
+    valid status transition is allowed — this is what keeps a played match a
+    stable historical object (see the Phase 4 plan's forward-compatibility
+    notes for Results/Media)."""
+    changes = payload.model_dump(exclude_unset=True)
+    changed_fields = sorted(changes)
+    requested_status = changes.pop("status", None)
+    before = {"status": fixture.status}
+    if changes and fixture.status != "SCHEDULED":
+        raise api_error(409, "FIXTURE_ALREADY_STARTED", "This match can no longer be edited")
+    if "team_a_id" in changes or "team_b_id" in changes:
+        team_a_id = changes.get("team_a_id", fixture.team_a_id)
+        team_b_id = changes.get("team_b_id", fixture.team_b_id)
+        if team_a_id == team_b_id:
+            raise api_error(422, "VALIDATION_ERROR", "A team cannot play itself")
+        _load_team_in_event_or_422(session, team_a_id, fixture.event_id)
+        _load_team_in_event_or_422(session, team_b_id, fixture.event_id)
+    for field, value in changes.items():
+        setattr(fixture, field, value)
+    if requested_status and requested_status != fixture.status:
+        if requested_status not in VALID_FIXTURE_TRANSITIONS.get(fixture.status, set()):
+            raise api_error(409, "INVALID_STATE_TRANSITION", f"Cannot move a match from {fixture.status} to {requested_status}")
+        fixture.status = requested_status
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        raise api_error(409, "FIXTURE_SEQUENCE_TAKEN", "A match with this number already exists for this event")
+    audit(
+        session, "FIXTURE_STATUS_CHANGED" if requested_status else "FIXTURE_UPDATED", "fixture", fixture.id,
+        {"fields": changed_fields}, actor_type="ORGANIZER", actor_id=organizer.id, before=before, after={"status": fixture.status},
+    )
+    session.commit(); session.refresh(fixture)
+    return fixture
+
+
+def fixture_to_response(fixture: Fixture) -> dict:
+    return {
+        "id": fixture.id, "event_id": fixture.event_id,
+        "team_a": {"id": fixture.team_a.id, "name": fixture.team_a.name, "short_code": fixture.team_a.short_code},
+        "team_b": {"id": fixture.team_b.id, "name": fixture.team_b.name, "short_code": fixture.team_b.short_code},
+        "sequence": fixture.sequence, "scheduled_at": fixture.scheduled_at, "venue_override": fixture.venue_override,
+        "status": fixture.status, "created_at": fixture.created_at, "updated_at": fixture.updated_at,
+    }
+
+
+def _player_active_registration(session: Session, event_id: int, user_id: int) -> Registration | None:
+    return session.scalar(
+        select(Registration).where(
+            Registration.match_id == event_id, Registration.user_id == user_id,
+            Registration.status.in_(ACTIVE_REGISTRATION_STATUSES),
+        )
+    )
+
+
+def player_team_response(session: Session, match: Match, user: User) -> dict:
+    registration = _player_active_registration(session, match.id, user.id)
+    member = session.scalar(select(TeamMember).where(TeamMember.registration_id == registration.id)) if registration else None
+    if not member:
+        return {"team": None, "teammates": []}
+    team = session.get(Team, member.team_id)
+    teammates = session.scalars(
+        select(TeamMember).options(joinedload(TeamMember.registration))
+        .where(TeamMember.team_id == team.id, TeamMember.id != member.id)
+    ).all()
+    return {
+        "team": {"id": team.id, "name": team.name, "short_code": team.short_code},
+        "teammates": [
+            {
+                "name": m.registration.name, "preferred_position": m.registration.preferred_position or "NO_PREFERENCE",
+                "assigned_position": m.registration.assigned_position,
+            }
+            for m in teammates
+        ],
+    }
+
+
+def player_fixtures_response(session: Session, match: Match, user: User) -> list[dict]:
+    registration = _player_active_registration(session, match.id, user.id)
+    my_member = session.scalar(select(TeamMember).where(TeamMember.registration_id == registration.id)) if registration else None
+    my_team_id = my_member.team_id if my_member else None
+    fixtures = session.scalars(
+        select(Fixture).options(joinedload(Fixture.team_a), joinedload(Fixture.team_b))
+        .where(Fixture.event_id == match.id).order_by(Fixture.scheduled_at)
+    ).unique().all()
+    return [
+        {
+            "id": f.id, "sequence": f.sequence, "scheduled_at": f.scheduled_at, "venue_override": f.venue_override,
+            "status": f.status, "team_a": {"id": f.team_a.id, "name": f.team_a.name, "short_code": f.team_a.short_code},
+            "team_b": {"id": f.team_b.id, "name": f.team_b.name, "short_code": f.team_b.short_code},
+            "my_team_id": my_team_id if my_team_id in (f.team_a_id, f.team_b_id) else None,
+        }
+        for f in fixtures
+    ]
 
 
 def backfill_missing_event_ownership(session: Session) -> None:

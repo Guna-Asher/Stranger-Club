@@ -4,7 +4,8 @@ from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import (
-    Boolean, CheckConstraint, Date, DateTime, ForeignKey, Index, Integer, JSON, String, Text, Time, text,
+    Boolean, CheckConstraint, Date, DateTime, ForeignKey, ForeignKeyConstraint, Index, Integer, JSON, String,
+    Text, Time, UniqueConstraint, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -34,6 +35,17 @@ PAYMENT_STATUSES = ("AWAITING_PROOF", "SUBMITTED", "VERIFIED", "REJECTED")
 # SUPERSEDED (the player uploaded a replacement before it was reviewed).
 # ACCEPTED/REJECTED/SUPERSEDED are all terminal for that proof row.
 PROOF_STATUSES = ("PENDING", "ACCEPTED", "REJECTED", "SUPERSEDED")
+
+# Phase 4: the scheduled game between two Teams. Internally named "Fixture"
+# to avoid colliding with the Match class above, which is actually the Event
+# entity — every user-facing string still says "Match"/"Matches" (see
+# services.py / routers/fixtures.py). Forward-only, mirroring
+# VALID_EVENT_TRANSITIONS's own reasoning: no COMPLETED -> SCHEDULED or other
+# nonsensical reverse transition.
+FIXTURE_STATUSES = ("SCHEDULED", "IN_PROGRESS", "COMPLETED", "CANCELLED")
+# A team's roster is locked (see TeamMember below) once any of its fixtures
+# reaches one of these statuses.
+FIXTURE_ROSTER_LOCKING_STATUSES = ("IN_PROGRESS", "COMPLETED")
 
 
 class Base(DeclarativeBase):
@@ -74,6 +86,8 @@ class Match(Base):
     payment_configuration: Mapped[EventPaymentConfiguration | None] = relationship(
         back_populates="match", uselist=False, cascade="all, delete-orphan"
     )
+    teams: Mapped[list[Team]] = relationship(back_populates="event", cascade="all, delete-orphan")
+    fixtures: Mapped[list[Fixture]] = relationship(back_populates="event", cascade="all, delete-orphan")
 
 
 class EventPaymentConfiguration(Base):
@@ -141,6 +155,11 @@ class Registration(Base):
     __tablename__ = "registrations"
     __table_args__ = (
         CheckConstraint(f"status IN {ALL_REGISTRATION_STATUSES}", name="ck_registration_status_valid"),
+        # Composite-FK target for TeamMember (see below): lets a TeamMember
+        # row require, at the database level, that its registration's event
+        # matches its team's event — id is already the PK, this just adds
+        # match_id alongside it for the composite reference.
+        UniqueConstraint("id", "match_id", name="uq_registration_id_match_id"),
         # One ACTIVE registration per (event, authenticated user). CANCELLED
         # rows are excluded from this index entirely, so a player can cancel
         # and register again as a brand-new, independent historical record —
@@ -253,6 +272,142 @@ class PaymentProof(Base):
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     payment: Mapped[Payment] = relationship(back_populates="proofs")
+
+
+class Team(Base):
+    """A competing side for exactly one Event. Deliberately minimal — no
+    logos, sponsors, ranking points, or player ratings (see Phase 4 scope)."""
+    __tablename__ = "teams"
+    __table_args__ = (
+        # Composite-FK target for TeamMember/Fixture below.
+        UniqueConstraint("id", "event_id", name="uq_team_id_event_id"),
+        UniqueConstraint("event_id", "name", name="uq_team_name_per_event"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey("matches.id"), index=True)
+    name: Mapped[str] = mapped_column(String(60))
+    short_code: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # Nullable = unlimited. Enforced in services.assign_team_member /
+    # move_team_member under a row lock, not a DB CHECK — a "count of related
+    # rows" constraint isn't portable across SQLite/PostgreSQL without
+    # triggers, so the lock is the real guard; see services.py.
+    max_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist, onupdate=now_ist)
+
+    event: Mapped[Match] = relationship(back_populates="teams")
+    members: Mapped[list[TeamMember]] = relationship(back_populates="team", cascade="all, delete-orphan")
+    # No reverse fixtures_as_a/fixtures_as_b relationship here: with two
+    # composite FKs both involving event_id (one per side), a bidirectional
+    # relationship would need the same disambiguating primaryjoin as
+    # Fixture.team_a/team_b below for no real benefit — services.py queries
+    # Fixture directly (e.g. "does this team have any locking fixture")
+    # instead.
+
+
+class TeamMember(Base):
+    """Links one Registration to one Team, both scoped to the same event.
+
+    Keyed to Registration, not PlayerProfile: Registration is already
+    event-scoped and stable (a cancelled registration is never reused; a new
+    attempt is a brand-new row — see cancel_registration/create_registration
+    in services.py), whereas PlayerProfile is a global, mutable record — a
+    later profile edit must never be able to retroactively reinterpret who
+    was on a team in a past event. registration_id is unique here: a
+    registration is on at most one team, ever, at a time, which is also what
+    makes "a player cannot belong to two teams in the same event" true for
+    free (a player has at most one active registration per event already).
+
+    The two ForeignKeyConstraints below are the actual cross-event integrity
+    guarantee, enforced by the database itself, not just Python: team_id must
+    belong to event_id, and registration_id must belong to event_id, so a
+    membership row spanning two different events is structurally impossible
+    to insert on either PostgreSQL or SQLite (with foreign_keys=ON — see
+    database.py).
+    """
+    __tablename__ = "team_members"
+    __table_args__ = (
+        UniqueConstraint("registration_id", name="uq_team_member_registration"),
+        ForeignKeyConstraint(["team_id", "event_id"], ["teams.id", "teams.event_id"], name="fk_team_member_team_event"),
+        ForeignKeyConstraint(
+            ["registration_id", "event_id"], ["registrations.id", "registrations.match_id"],
+            name="fk_team_member_registration_event",
+        ),
+        Index("ix_team_members_team_id", "team_id"),
+        Index("ix_team_members_event_id", "event_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    team_id: Mapped[int] = mapped_column(Integer)
+    registration_id: Mapped[int] = mapped_column(Integer)
+    # Denormalized on purpose — required by the composite FKs above, which
+    # are what make the cross-event guarantee a database-level fact.
+    event_id: Mapped[int] = mapped_column(Integer)
+    assigned_by_organizer_id: Mapped[int | None] = mapped_column(ForeignKey("organizers.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist, onupdate=now_ist)
+
+    team: Mapped[Team] = relationship(back_populates="members")
+    # overlaps: event_id is intentionally written explicitly by services.py
+    # (never via relationship assignment), shared between this FK and
+    # TeamMember.team's — silences SQLAlchemy's (accurate, harmless-here)
+    # warning about the two relationships both touching that column.
+    registration: Mapped[Registration] = relationship(overlaps="members,team")
+
+
+class Fixture(Base):
+    """A scheduled game between two Teams belonging to the same Event.
+
+    Named "Fixture" only to avoid colliding with the Match class above
+    (which is the Event entity) — the product UI always calls this "Match"/
+    "Matches". No live scoring, innings, or result fields yet (see Phase 4
+    scope) — Fixture.id is a stable, never-reused, never-deleted identity a
+    later Results phase can attach to without any redesign here.
+    """
+    __tablename__ = "fixtures"
+    __table_args__ = (
+        ForeignKeyConstraint(["team_a_id", "event_id"], ["teams.id", "teams.event_id"], name="fk_fixture_team_a_event"),
+        ForeignKeyConstraint(["team_b_id", "event_id"], ["teams.id", "teams.event_id"], name="fk_fixture_team_b_event"),
+        CheckConstraint("team_a_id != team_b_id", name="ck_fixture_teams_distinct"),
+        CheckConstraint(f"status IN {FIXTURE_STATUSES}", name="ck_fixture_status_valid"),
+        # Optional organizer-assigned ordering; unique within an event only
+        # when actually set (same partial-unique-index pattern as
+        # uq_registration_active_per_user).
+        Index(
+            "uq_fixture_sequence_per_event", "event_id", "sequence", unique=True,
+            sqlite_where=text("sequence IS NOT NULL"),
+            postgresql_where=text("sequence IS NOT NULL"),
+        ),
+        Index("ix_fixtures_event_status", "event_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey("matches.id"), index=True)
+    team_a_id: Mapped[int] = mapped_column(Integer)
+    team_b_id: Mapped[int] = mapped_column(Integer)
+    sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    venue_override: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="SCHEDULED")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist, onupdate=now_ist)
+
+    event: Mapped[Match] = relationship(back_populates="fixtures")
+    # Explicit primaryjoin: event_id participates in *both* composite FKs
+    # (team_a's and team_b's), so SQLAlchemy's automatic FK-constraint
+    # detection is ambiguous here — spelling out the join removes any
+    # guesswork about which constraint applies to which relationship.
+    team_a: Mapped[Team] = relationship(
+        foreign_keys=[team_a_id, event_id],
+        primaryjoin="and_(Fixture.team_a_id == Team.id, Fixture.event_id == Team.event_id)",
+        overlaps="event,fixtures",
+    )
+    team_b: Mapped[Team] = relationship(
+        foreign_keys=[team_b_id, event_id],
+        primaryjoin="and_(Fixture.team_b_id == Team.id, Fixture.event_id == Team.event_id)",
+        overlaps="event,fixtures,team_a",
+    )
 
 
 class Organizer(Base):

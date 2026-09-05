@@ -8,6 +8,9 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 Position = Literal["BATSMAN", "BOWLER", "ALL_ROUNDER", "WICKET_KEEPER", "NO_PREFERENCE"]
 EventStatus = Literal["DRAFT", "OPEN", "FULL", "ONGOING", "COMPLETED", "CANCELLED"]
+# Internal name only — see models.Fixture's docstring. Every user-facing
+# string still says "Match"/"Matches".
+FixtureStatus = Literal["SCHEDULED", "IN_PROGRESS", "COMPLETED", "CANCELLED"]
 
 UPI_ID_PATTERN = re.compile(r"^[a-zA-Z0-9.\-]{2,256}@[a-zA-Z][a-zA-Z]{1,64}$")
 
@@ -285,3 +288,161 @@ class RegistrationResponse(BaseModel):
 
 class AdminMatchDetail(MatchResponse):
     registrations: list[RegistrationResponse]
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Teams and Matches (internal name Fixture — see models.py)
+# ---------------------------------------------------------------------------
+
+class TeamCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    short_code: str | None = Field(default=None, max_length=10)
+    max_size: int | None = Field(default=None, ge=1, le=100)
+
+    @field_validator("name")
+    @classmethod
+    def trim_name(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if not value:
+            raise ValueError("Team name cannot be blank")
+        return value
+
+    @field_validator("short_code", mode="before")
+    @classmethod
+    def blank_short_code_is_none(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value.strip().upper() if isinstance(value, str) else value
+
+
+class TeamUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=60)
+    short_code: str | None = Field(default=None, max_length=10)
+    max_size: int | None = Field(default=None, ge=1, le=100)
+
+    @field_validator("name")
+    @classmethod
+    def trim_name(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if not value:
+            raise ValueError("Team name cannot be blank")
+        return value
+
+    @field_validator("short_code", mode="before")
+    @classmethod
+    def blank_short_code_is_none(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value.strip().upper() if isinstance(value, str) else value
+
+
+class TeamResponse(BaseModel):
+    id: int
+    event_id: int
+    name: str
+    short_code: str | None = None
+    max_size: int | None = None
+    member_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class TeamMemberResponse(BaseModel):
+    id: int
+    team_id: int
+    registration_id: int
+    player_name: str
+    preferred_position: str = "NO_PREFERENCE"
+    assigned_position: str | None = None
+    created_at: datetime
+
+
+class TeamRosterResponse(TeamResponse):
+    members: list[TeamMemberResponse]
+
+
+class TeamMemberAssign(BaseModel):
+    registration_id: int
+
+
+class TeamMemberMove(BaseModel):
+    team_id: int
+
+
+class TeamSummary(BaseModel):
+    id: int
+    name: str
+    short_code: str | None = None
+
+
+class FixtureCreate(BaseModel):
+    team_a_id: int
+    team_b_id: int
+    scheduled_at: datetime
+    sequence: int | None = Field(default=None, ge=1)
+    venue_override: str | None = Field(default=None, max_length=200)
+
+    @field_validator("venue_override", mode="before")
+    @classmethod
+    def blank_venue_is_none(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("team_b_id")
+    @classmethod
+    def teams_must_differ(cls, value: int, info) -> int:
+        if "team_a_id" in info.data and value == info.data["team_a_id"]:
+            raise ValueError("A team cannot play itself")
+        return value
+
+
+class FixtureUpdate(BaseModel):
+    team_a_id: int | None = None
+    team_b_id: int | None = None
+    scheduled_at: datetime | None = None
+    sequence: int | None = Field(default=None, ge=1)
+    venue_override: str | None = Field(default=None, max_length=200)
+    status: FixtureStatus | None = None
+
+    @field_validator("venue_override", mode="before")
+    @classmethod
+    def blank_venue_is_none(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value.strip() if isinstance(value, str) else value
+
+
+class FixtureResponse(BaseModel):
+    id: int
+    event_id: int
+    team_a: TeamSummary
+    team_b: TeamSummary
+    sequence: int | None = None
+    scheduled_at: datetime
+    venue_override: str | None = None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class PlayerTeammate(BaseModel):
+    name: str
+    preferred_position: str = "NO_PREFERENCE"
+    assigned_position: str | None = None
+
+
+class PlayerTeamResponse(BaseModel):
+    team: TeamSummary | None = None
+    teammates: list[PlayerTeammate] = []
+
+
+class PlayerFixtureResponse(BaseModel):
+    id: int
+    sequence: int | None = None
+    scheduled_at: datetime
+    venue_override: str | None = None
+    status: str
+    team_a: TeamSummary
+    team_b: TeamSummary
+    my_team_id: int | None = None

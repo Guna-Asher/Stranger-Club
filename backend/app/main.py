@@ -18,7 +18,7 @@ from .models import Match, Organizer
 from .otp.base import OtpProvider
 from .otp.console import ConsoleOtpProvider
 from .realtime import InProcessBroadcaster, PostgresBroadcaster
-from .routers import admin, auth, events, payments, player_auth, registrations
+from .routers import admin, auth, events, fixtures, payments, player_auth, registrations, teams
 from .services import api_error, backfill_missing_event_ownership, seed_database
 from .storage import LocalFilesystemStorage, Storage
 
@@ -36,7 +36,7 @@ logger = logging.getLogger("stranger_club")
 # that partially failed) fails readiness instead of serving traffic against
 # an unexpected schema. SQLite dev/test databases are stamped to head at
 # every startup (see database.py) so this check only applies to PostgreSQL.
-ALEMBIC_EXPECTED_HEAD = "0007"
+ALEMBIC_EXPECTED_HEAD = "0008"
 
 
 def _resolve_database_url(config: AppConfig, data_dir: Path | None, database_url: str | None) -> str:
@@ -198,6 +198,8 @@ def create_app(
     app.include_router(registrations.router)
     app.include_router(payments.router)
     app.include_router(admin.router)
+    app.include_router(teams.router)
+    app.include_router(fixtures.router)
 
     frontend_dir = frontend_dir or Path(__file__).resolve().parents[2] / "frontend_dist"
     if frontend_dir.is_dir() and (frontend_dir / "index.html").is_file():

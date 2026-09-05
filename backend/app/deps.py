@@ -11,7 +11,10 @@ from fastapi import Depends, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
-from .models import Match, Organizer, OrganizerSession, Payment, PaymentProof, PlayerSession, Registration, User, now_ist
+from .models import (
+    Fixture, Match, Organizer, OrganizerSession, Payment, PaymentProof, PlayerSession, Registration, Team,
+    TeamMember, User, now_ist,
+)
 from .services import api_error, event_summary
 
 logger = logging.getLogger("stranger_club")
@@ -129,6 +132,32 @@ def require_registration_access(registration_id: int, organizer: Organizer = Dep
     if not registration or not organizer_owns_event(organizer, registration.match):
         raise api_error(404, "RESOURCE_NOT_FOUND", "Registration not found")
     return registration
+
+
+def require_team_access(team_id: int, organizer: Organizer = Depends(require_admin), session: Session = Depends(get_session)) -> Team:
+    """Same 404-not-403 ownership pattern as require_event_access, checked
+    through the team's own event — a team's identity is meaningless outside
+    the event it belongs to, so ownership is always transitive through it."""
+    team = session.scalar(select(Team).options(joinedload(Team.event)).where(Team.id == team_id))
+    if not team or not organizer_owns_event(organizer, team.event):
+        raise api_error(404, "RESOURCE_NOT_FOUND", "Team not found")
+    return team
+
+
+def require_team_member_access(team_member_id: int, organizer: Organizer = Depends(require_admin), session: Session = Depends(get_session)) -> TeamMember:
+    member = session.scalar(
+        select(TeamMember).options(joinedload(TeamMember.team).joinedload(Team.event)).where(TeamMember.id == team_member_id)
+    )
+    if not member or not organizer_owns_event(organizer, member.team.event):
+        raise api_error(404, "RESOURCE_NOT_FOUND", "Team member not found")
+    return member
+
+
+def require_fixture_access(fixture_id: int, organizer: Organizer = Depends(require_admin), session: Session = Depends(get_session)) -> Fixture:
+    fixture = session.scalar(select(Fixture).options(joinedload(Fixture.event)).where(Fixture.id == fixture_id))
+    if not fixture or not organizer_owns_event(organizer, fixture.event):
+        raise api_error(404, "RESOURCE_NOT_FOUND", "Match not found")
+    return fixture
 
 
 def publish_event_update(request: Request, session: Session, match_id: int, kind: str) -> None:

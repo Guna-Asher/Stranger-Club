@@ -5,7 +5,7 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -66,7 +66,20 @@ def _run_alembic_migrations(database_url: str, *, fresh: bool) -> None:
 
 
 def _make_sqlite_engine(database_url: str):
-    return create_engine(database_url, connect_args={"check_same_thread": False})
+    engine = create_engine(database_url, connect_args={"check_same_thread": False})
+
+    # Off by default in SQLite. Phase 4 relies on real foreign-key
+    # enforcement (composite FKs on teams/team_members/fixtures — see
+    # models.py) to make cross-event references structurally impossible, not
+    # just Python-checked; without this, SQLite dev/test would silently
+    # accept violations that PostgreSQL rejects.
+    @event.listens_for(engine, "connect")
+    def _enable_sqlite_foreign_keys(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    return engine
 
 
 def _make_postgres_engine(database_url: str, *, pool_size: int, max_overflow: int):
