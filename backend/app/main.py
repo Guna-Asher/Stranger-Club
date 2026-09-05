@@ -14,14 +14,16 @@ from sqlalchemy import select
 from .database import make_session_factory
 from .deps import PASSWORD_HASHER, EventBroadcaster
 from .models import Match, Organizer
-from .routers import admin, auth, events, payments, registrations
+from .otp.base import OtpProvider
+from .otp.console import ConsoleOtpProvider
+from .routers import admin, auth, events, payments, player_auth, registrations
 from .services import api_error, seed_database
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("stranger_club")
 
 
-def create_app(data_dir: Path | None = None, frontend_dir: Path | None = None, admin_username: str | None = None, admin_password: str | None = None) -> FastAPI:
+def create_app(data_dir: Path | None = None, frontend_dir: Path | None = None, admin_username: str | None = None, admin_password: str | None = None, otp_provider: OtpProvider | None = None) -> FastAPI:
     data_dir = data_dir or Path(os.getenv("SC_DATA_DIR", "data")); uploads_dir = data_dir / "uploads"
     session_factory = make_session_factory(data_dir / "stranger_club.db")
     username = admin_username or os.getenv("SC_ADMIN_USERNAME", "organizer")
@@ -45,6 +47,9 @@ def create_app(data_dir: Path | None = None, frontend_dir: Path | None = None, a
     app = FastAPI(title="Stranger Club API", version="2.0.0", lifespan=lifespan)
     app.state.session_factory = session_factory; app.state.uploads_dir = uploads_dir; app.state.broadcaster = EventBroadcaster(); app.state.login_attempts: dict[str, list[float]] = {}
     app.state.registration_attempts: dict[str, list[float]] = {}; app.state.payment_upload_attempts: dict[str, list[float]] = {}
+    app.state.otp_provider = otp_provider or ConsoleOtpProvider()
+    app.state.otp_request_ip_attempts: dict[str, list[float]] = {}; app.state.otp_request_phone_attempts: dict[str, list[float]] = {}
+    app.state.otp_verify_ip_attempts: dict[str, list[float]] = {}
 
     @app.exception_handler(HTTPException)
     async def http_error_handler(_: Request, exc: HTTPException):
@@ -72,6 +77,7 @@ def create_app(data_dir: Path | None = None, frontend_dir: Path | None = None, a
         return {"status": "ready"}
 
     app.include_router(auth.router)
+    app.include_router(player_auth.router)
     app.include_router(events.router)
     app.include_router(registrations.router)
     app.include_router(payments.router)

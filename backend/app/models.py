@@ -60,6 +60,10 @@ class Registration(Base):
     public_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     match_id: Mapped[int] = mapped_column(ForeignKey("matches.id"), index=True)
     player_id: Mapped[int | None] = mapped_column(ForeignKey("players.id"), index=True, nullable=True)
+    # The authenticated owner of this registration. NULL only for rows created
+    # before player authentication existed; such rows are intentionally not
+    # accessible through the owner-checked endpoints (no NULL == NULL fallback).
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True, nullable=True)
     name: Mapped[str] = mapped_column(String(120))
     phone: Mapped[str] = mapped_column(String(16))
     email: Mapped[str | None] = mapped_column(String(254), nullable=True)
@@ -72,6 +76,7 @@ class Registration(Base):
 
     match: Mapped[Match] = relationship(back_populates="registrations")
     player: Mapped[Player | None] = relationship(back_populates="registrations")
+    user: Mapped[User | None] = relationship()
     payment: Mapped[Payment | None] = relationship(back_populates="registration", uselist=False, cascade="all, delete-orphan")
 
 
@@ -125,4 +130,66 @@ class AuditLog(Base):
     entity_type: Mapped[str] = mapped_column(String(80))
     entity_id: Mapped[str] = mapped_column(String(80))
     metadata_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
+
+
+class User(Base):
+    """Authenticated player identity. Kept separate from profile data (PlayerProfile)."""
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    phone: Mapped[str] = mapped_column(String(16), unique=True, index=True)
+    phone_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    email: Mapped[str | None] = mapped_column(String(254), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist, onupdate=now_ist)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    profile: Mapped[PlayerProfile | None] = relationship(back_populates="user", uselist=False, cascade="all, delete-orphan")
+
+
+class PlayerProfile(Base):
+    """Editable profile data, separate from the auth identity in User."""
+    __tablename__ = "player_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
+    display_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    cricket_role: Mapped[str] = mapped_column(String(32), default="NO_PREFERENCE")
+    skill_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    photo_storage_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    bio: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist, onupdate=now_ist)
+
+    user: Mapped[User] = relationship(back_populates="profile")
+
+
+class PlayerSession(Base):
+    __tablename__ = "player_sessions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    csrf_token: Mapped[str] = mapped_column(String(128))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
+
+    user: Mapped[User] = relationship()
+
+
+class OtpChallenge(Base):
+    """A single OTP code issued for a phone number. Only one active (unconsumed,
+    unexpired) challenge per phone is intended to exist at a time — requesting a
+    new code invalidates any prior one (see services_player.request_otp)."""
+    __tablename__ = "otp_challenges"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    phone: Mapped[str] = mapped_column(String(16), index=True)
+    code_hash: Mapped[str] = mapped_column(String(128))
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)

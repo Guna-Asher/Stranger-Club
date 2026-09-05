@@ -54,3 +54,14 @@ def upgrade(connection: Connection) -> None:
     if "20260818_registration_defaults" not in applied and _has_column(connection, "registrations", "preferred_position"):
         connection.execute(text("UPDATE registrations SET preferred_position = 'NO_PREFERENCE' WHERE preferred_position IS NULL"))
         connection.execute(text("INSERT INTO schema_migrations(version) VALUES ('20260818_registration_defaults')"))
+
+    # Player identity (users/player_profiles/player_sessions/otp_challenges) are
+    # brand-new tables, created automatically by Base.metadata.create_all for
+    # every installation. Only the new column on the pre-existing registrations
+    # table needs an explicit migration. Rows created before this version keep
+    # user_id = NULL and are intentionally never matched by the ownership check
+    # (NULL never equals an authenticated user's id) — no legacy access path.
+    if "20260906_player_identity" not in applied and _has_column(connection, "registrations", "id"):
+        if not _has_column(connection, "registrations", "user_id"):
+            connection.execute(text("ALTER TABLE registrations ADD COLUMN user_id INTEGER"))
+        connection.execute(text("INSERT INTO schema_migrations(version) VALUES ('20260906_player_identity')"))

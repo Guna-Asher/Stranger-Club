@@ -11,7 +11,7 @@ from fastapi import Depends, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
-from .models import Match, Organizer, OrganizerSession, now_ist
+from .models import Match, Organizer, OrganizerSession, PlayerSession, User, now_ist
 from .services import api_error, event_summary
 
 SESSION_COOKIE = "sc_organizer_session"
@@ -21,6 +21,15 @@ REGISTRATION_RATE_LIMIT = 20
 REGISTRATION_RATE_WINDOW_SECONDS = 3600
 PAYMENT_UPLOAD_RATE_LIMIT = 20
 PAYMENT_UPLOAD_RATE_WINDOW_SECONDS = 3600
+
+PLAYER_SESSION_COOKIE = "sc_player_session"
+PLAYER_SESSION_DAYS = int(os.getenv("SC_PLAYER_SESSION_DAYS", "30"))
+OTP_REQUEST_PHONE_LIMIT = 5
+OTP_REQUEST_PHONE_WINDOW_SECONDS = 3600
+OTP_REQUEST_IP_LIMIT = 10
+OTP_REQUEST_IP_WINDOW_SECONDS = 3600
+OTP_VERIFY_IP_LIMIT = 20
+OTP_VERIFY_IP_WINDOW_SECONDS = 3600
 
 
 class EventBroadcaster:
@@ -78,3 +87,23 @@ def require_csrf(request: Request, context: tuple[Organizer, OrganizerSession] =
 def publish_event_update(request: Request, session: Session, match_id: int, kind: str) -> None:
     match = session.get(Match, match_id)
     if match: request.app.state.broadcaster.publish(match.public_id, kind, event_summary(session, match))
+
+
+def player_auth_context(request: Request, session: Session = Depends(get_session)) -> tuple[User, PlayerSession]:
+    raw = request.cookies.get(PLAYER_SESSION_COOKIE)
+    if not raw: raise api_error(401, "UNAUTHORIZED", "Authentication required")
+    active = session.scalar(select(PlayerSession).options(joinedload(PlayerSession.user)).where(PlayerSession.token_hash == token_hash(raw)))
+    if not active or active.expires_at <= now_ist() or not active.user.is_active:
+        if active: session.delete(active); session.commit()
+        raise api_error(401, "UNAUTHORIZED", "Authentication required")
+    active.last_seen_at = now_ist(); session.commit()
+    return active.user, active
+
+
+def require_player(context: tuple[User, PlayerSession] = Depends(player_auth_context)) -> User: return context[0]
+
+
+def require_player_csrf(request: Request, context: tuple[User, PlayerSession] = Depends(player_auth_context)) -> User:
+    if not secrets.compare_digest(request.headers.get("X-CSRF-Token", ""), context[1].csrf_token):
+        raise api_error(403, "CSRF_INVALID", "Security token is invalid or expired")
+    return context[0]

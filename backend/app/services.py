@@ -11,7 +11,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
-from .models import AuditLog, Match, Payment, Player, Registration, now_ist
+from .models import AuditLog, Match, Payment, Player, Registration, User, now_ist
 from .schemas import EventUpdate, MatchCreate, RegistrationCreate
 
 logger = logging.getLogger("stranger_club")
@@ -137,23 +137,32 @@ def _refresh_full_status(session: Session, match: Match) -> None:
         match.status = "FULL" if match_counts(session, match.id)["confirmed"] >= match.capacity else "OPEN"
 
 
-def create_registration(session: Session, match: Match, payload: RegistrationCreate) -> Registration:
+def assert_registration_owner(registration: Registration, user_id: int) -> None:
+    """A mismatch reports 404, not 403: an ownership check must not confirm to
+    a caller that a registration exists at all when it isn't theirs."""
+    if registration.user_id != user_id:
+        raise api_error(404, "RESOURCE_NOT_FOUND", "Registration not found")
+
+
+def create_registration(session: Session, match: Match, payload: RegistrationCreate, user: User) -> Registration:
     if match.registration_deadline < now_ist() or match.status not in {"OPEN", "FULL"}:
         raise api_error(409, "REGISTRATION_CLOSED", "Registration for this event has closed")
     # SQLite BEGIN IMMEDIATE serialises the capacity decision. PostgreSQL can
     # replace this with SELECT ... FOR UPDATE without changing this service API.
     session.rollback(); session.execute(text("BEGIN IMMEDIATE"))
     match = session.scalar(select(Match).where(Match.id == match.id))
-    player = session.scalar(select(Player).where(Player.phone == payload.phone))
+    # Phone comes from the OTP-verified session, never from the request payload.
+    phone = user.phone
+    player = session.scalar(select(Player).where(Player.phone == phone))
     if not player:
-        player = Player(phone=payload.phone, name=payload.name, email=str(payload.email) if payload.email else None, preferred_position=payload.preferred_position)
+        player = Player(phone=phone, name=payload.name, email=str(payload.email) if payload.email else None, preferred_position=payload.preferred_position)
         session.add(player); session.flush()
     else:
         player.name = payload.name; player.email = str(payload.email) if payload.email else player.email
         player.preferred_position = payload.preferred_position
     confirmed = match_counts(session, match.id)["confirmed"]
-    registration = Registration(public_id=uuid.uuid4().hex, match_id=match.id, player_id=player.id, name=payload.name,
-        phone=payload.phone, email=str(payload.email) if payload.email else None, preferred_position=payload.preferred_position,
+    registration = Registration(public_id=uuid.uuid4().hex, match_id=match.id, player_id=player.id, user_id=user.id, name=payload.name,
+        phone=phone, email=str(payload.email) if payload.email else None, preferred_position=payload.preferred_position,
         status=WAITLISTED if confirmed >= match.capacity else PENDING)
     session.add(registration)
     try:
@@ -184,9 +193,10 @@ async def store_payment_proof(upload: UploadFile, uploads_dir: Path) -> tuple[st
     return filename, uuid.uuid4().hex
 
 
-async def submit_payment(session: Session, registration_key: str, upload: UploadFile, uploads_dir: Path) -> Registration:
+async def submit_payment(session: Session, registration_key: str, upload: UploadFile, uploads_dir: Path, user_id: int) -> Registration:
     registration = session.scalar(select(Registration).options(joinedload(Registration.match), joinedload(Registration.payment)).where(Registration.public_id == registration_key))
     if not registration: raise api_error(404, "RESOURCE_NOT_FOUND", "Registration not found")
+    assert_registration_owner(registration, user_id)
     if registration.status == WAITLISTED: raise api_error(409, "EVENT_FULL", "This registration is on the waitlist")
     if registration.status == CONFIRMED: raise api_error(409, "PAYMENT_ALREADY_VERIFIED", "This registration is already confirmed")
     if registration.payment and registration.payment.status == PAYMENT_SUBMITTED:

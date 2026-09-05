@@ -9,6 +9,15 @@ Position = Literal["BATSMAN", "BOWLER", "ALL_ROUNDER", "WICKET_KEEPER", "NO_PREF
 EventStatus = Literal["DRAFT", "OPEN", "FULL", "ONGOING", "COMPLETED", "CANCELLED"]
 
 
+def normalize_phone(value: str) -> str:
+    cleaned = value.replace(" ", "").replace("-", "")
+    if cleaned.startswith("+91"):
+        cleaned = cleaned[3:]
+    if not (cleaned.isdigit() and len(cleaned) == 10):
+        raise ValueError("Enter a valid 10-digit phone number")
+    return cleaned
+
+
 class MatchCreate(BaseModel):
     name: str = Field(min_length=3, max_length=120)
     date: date_type
@@ -51,8 +60,9 @@ class EventUpdate(BaseModel):
 
 
 class RegistrationCreate(BaseModel):
+    # Phone is not submitted here: it comes from the OTP-verified player
+    # session, never from client-supplied request data.
     name: str = Field(min_length=2, max_length=120)
-    phone: str = Field(min_length=10, max_length=16)
     email: EmailStr | None = None
     preferred_position: Position = "NO_PREFERENCE"
 
@@ -61,15 +71,46 @@ class RegistrationCreate(BaseModel):
     def clean_name(cls, value: str) -> str:
         return " ".join(value.split())
 
+    @field_validator("email", mode="before")
+    @classmethod
+    def blank_email_is_none(cls, value):
+        # The optional email field is intentionally omittable; an empty string
+        # (what a blank form field submits) means the same thing as omitting
+        # it entirely, not an invalid email address.
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+
+class OtpRequest(BaseModel):
+    phone: str = Field(min_length=10, max_length=16)
+
     @field_validator("phone")
     @classmethod
     def valid_phone(cls, value: str) -> str:
-        cleaned = value.replace(" ", "").replace("-", "")
-        if cleaned.startswith("+91"):
-            cleaned = cleaned[3:]
-        if not (cleaned.isdigit() and len(cleaned) == 10):
-            raise ValueError("Enter a valid 10-digit phone number")
-        return cleaned
+        return normalize_phone(value)
+
+
+class OtpVerify(BaseModel):
+    phone: str = Field(min_length=10, max_length=16)
+    code: str = Field(min_length=6, max_length=6)
+
+    @field_validator("phone")
+    @classmethod
+    def valid_phone(cls, value: str) -> str:
+        return normalize_phone(value)
+
+    @field_validator("code")
+    @classmethod
+    def digits_only(cls, value: str) -> str:
+        if not value.isdigit():
+            raise ValueError("Enter the 6-digit code")
+        return value
+
+
+class PlayerAuthResponse(BaseModel):
+    phone: str
+    csrf_token: str
 
 
 class RejectRequest(BaseModel):
