@@ -16,11 +16,12 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 
 from .models import (
     ACTIVE_REGISTRATION_STATUSES, AuditLog, EventPaymentConfiguration, Fixture, FIXTURE_ROSTER_LOCKING_STATUSES,
-    Match, Organizer, Payment, PaymentProof, Registration, Team, TeamMember, User, now_ist,
+    Match, MatchParticipant, MatchResult, Organizer, Payment, PaymentProof, Registration, Team, TeamMember, User,
+    now_ist,
 )
 from .schemas import (
-    EventUpdate, FixtureCreate, FixtureUpdate, MatchCreate, PaymentConfigurationUpdate, RegistrationCreate,
-    TeamCreate, TeamUpdate,
+    EventUpdate, FixtureCreate, FixtureUpdate, MatchCreate, MatchParticipantEntry, MatchResultCreate,
+    MatchResultUpdate, PaymentConfigurationUpdate, RegistrationCreate, TeamCreate, TeamUpdate,
 )
 from .storage import Storage
 
@@ -422,7 +423,17 @@ def create_registration(session: Session, match: Match, payload: RegistrationCre
     # full stop.
     begin_serialized_write(session)
     lock_row(session, Match, match.id)
-    match = session.scalar(select(Match).options(joinedload(Match.payment_configuration)).where(Match.id == match.id))
+    # populate_existing=True: `match` was already loaded once by the caller
+    # (get_public_match, in the same session) before this lock was acquired.
+    # Without it, SQLAlchemy's identity map would silently keep serving that
+    # pre-lock `match` object's already-loaded attributes (capacity,
+    # payment_configuration) instead of the fresh, now-locked row — see
+    # _load_registration_for_payment's docstring for the concurrency bug
+    # this pattern caused elsewhere, reproduced and fixed in this same pass.
+    match = session.scalar(
+        select(Match).options(joinedload(Match.payment_configuration)).where(Match.id == match.id)
+        .execution_options(populate_existing=True)
+    )
     config = match.payment_configuration
     if not config:
         raise api_error(409, "EVENT_PAYMENT_NOT_CONFIGURED", "This event has no payment configuration")
@@ -466,7 +477,14 @@ def cancel_registration(session: Session, registration_id: int, *, actor_type: s
     create_registration turns into a brand-new historical record."""
     begin_serialized_write(session)
     lock_row(session, Registration, registration_id)
-    registration = session.scalar(select(Registration).options(joinedload(Registration.match)).where(Registration.id == registration_id))
+    # populate_existing=True: the caller (a router dependency) already loaded
+    # this Registration in the same session before the lock — see the note
+    # in _load_registration_for_payment for why a plain re-query here would
+    # otherwise silently keep serving the pre-lock, now-stale status/match.
+    registration = session.scalar(
+        select(Registration).options(joinedload(Registration.match)).where(Registration.id == registration_id)
+        .execution_options(populate_existing=True)
+    )
     if not registration:
         raise api_error(404, "RESOURCE_NOT_FOUND", "Registration not found")
     if registration.status == CANCELLED:
@@ -541,12 +559,30 @@ def persist_image(storage: Storage, content: bytes, image_format: str) -> str:
     return key
 
 
-def _load_registration_for_payment(session: Session, registration_key: str) -> Registration:
-    registration = session.scalar(
-        select(Registration).options(
-            joinedload(Registration.match), joinedload(Registration.payment).joinedload(Payment.proofs),
-        ).where(Registration.public_id == registration_key)
-    )
+def _load_registration_for_payment(session: Session, registration_key: str, *, populate_existing: bool = False) -> Registration:
+    """populate_existing=True is required for the *second* load in
+    submit_payment_proof (the one taken after lock_row). Without it, if this
+    Registration/Payment/proofs identity was already loaded earlier in this
+    same session (which it always is here — see submit_payment_proof's
+    pre-lock load), SQLAlchemy's identity map serves the already-populated
+    `payment.proofs` collection as-is and does *not* refresh it from this
+    query's results, even though this is a genuinely fresh SELECT. That
+    silently defeated the whole point of re-checking after the lock: a
+    concurrent request's newly committed PENDING proof would stay invisible,
+    so the idempotent-duplicate check below would wrongly decide "no
+    existing pending proof" and attempt a second INSERT, which only the
+    database's own uq_payment_proof_one_pending constraint would catch —
+    surfacing as an unhandled IntegrityError instead of the intended
+    idempotent short-circuit. Reproduced directly against real PostgreSQL
+    (~20% of runs) before this fix; see tests/test_api.py's concurrent
+    payment-proof-submission test.
+    """
+    stmt = select(Registration).options(
+        joinedload(Registration.match), joinedload(Registration.payment).joinedload(Payment.proofs),
+    ).where(Registration.public_id == registration_key)
+    if populate_existing:
+        stmt = stmt.execution_options(populate_existing=True)
+    registration = session.scalar(stmt)
     if not registration: raise api_error(404, "RESOURCE_NOT_FOUND", "Registration not found")
     return registration
 
@@ -592,7 +628,7 @@ async def submit_payment_proof(session: Session, registration_key: str, upload: 
 
     begin_serialized_write(session)
     lock_row(session, Payment, payment.id)
-    registration = _load_registration_for_payment(session, registration_key)
+    registration = _load_registration_for_payment(session, registration_key, populate_existing=True)
     payment = registration.payment
     try:
         _assert_registration_open_for_payment(registration)
@@ -654,12 +690,41 @@ def review_payment(session: Session, payment_id: int, approve: bool, *, actor_id
     PENDING proof (an invariant the database also enforces — see
     uq_payment_proof_one_pending); a SUBMITTED payment with none would be a
     data-integrity bug, not a normal 409, so it raises rather than guessing
-    which proof to act on."""
+    which proof to act on.
+
+    Locks both Match and Payment, in that order. The capacity decision below
+    ("is this event already full?") is fundamentally about the *event*, not
+    this one payment — locking only Payment (as an earlier version of this
+    function did) let two organizers concurrently approve two *different*
+    payments for the same nearly-full event, both read the same
+    under-capacity confirmed count, and both confirm, exceeding capacity.
+    Reproduced against real PostgreSQL
+    (test_concurrent_confirmation_after_cancellation_frees_slot) before this
+    fix. Match is locked first, matching create_registration's lock order,
+    so the two can never deadlock against each other.
+    """
+    preliminary_match_id = session.scalar(
+        select(Registration.match_id).join(Payment, Payment.registration_id == Registration.id).where(Payment.id == payment_id)
+    )
+    if not preliminary_match_id:
+        raise api_error(404, "RESOURCE_NOT_FOUND", "Payment not found")
     begin_serialized_write(session)
+    lock_row(session, Match, preliminary_match_id)
     lock_row(session, Payment, payment_id)
+    # populate_existing=True: require_payment_access (a router dependency)
+    # already loaded this Payment in the same session before the lock.
+    # Without this, a second concurrent review of the same payment would
+    # read this now-stale, pre-lock `payment.status` — still SUBMITTED in
+    # memory even after the first review already committed VERIFIED/REJECTED
+    # — and the PAYMENT_ALREADY_REVIEWED guard below would never fire,
+    # letting a payment be reviewed twice and its final status become
+    # whichever reviewer's stale transition committed last. See
+    # _load_registration_for_payment's docstring for the sibling bug this
+    # same pattern caused (and reproduced against real PostgreSQL) in
+    # submit_payment_proof.
     payment = session.scalar(
         select(Payment).options(joinedload(Payment.registration).joinedload(Registration.match), joinedload(Payment.proofs))
-        .where(Payment.id == payment_id)
+        .where(Payment.id == payment_id).execution_options(populate_existing=True)
     )
     if not payment: raise api_error(404, "RESOURCE_NOT_FOUND", "Payment not found")
     if payment.status != PAYMENT_SUBMITTED: raise api_error(409, "PAYMENT_ALREADY_REVIEWED", "Payment has already been reviewed")
@@ -691,9 +756,25 @@ def review_payment(session: Session, payment_id: int, approve: bool, *, actor_id
 
 
 def promote_waitlisted(session: Session, registration_id: int, *, actor_id: int) -> Registration:
+    """Locks Match before Registration, same reasoning and order as
+    review_payment: the capacity check below ("is there room?") and the FIFO
+    check are both properties of the whole event's waitlist, not of this one
+    registration — locking only Registration would let two different
+    waitlisted registrations in the same event be promoted concurrently,
+    both reading the same under-capacity snapshot."""
+    preliminary_match_id = session.scalar(select(Registration.match_id).where(Registration.id == registration_id))
+    if not preliminary_match_id:
+        raise api_error(404, "RESOURCE_NOT_FOUND", "Registration not found")
     begin_serialized_write(session)
+    lock_row(session, Match, preliminary_match_id)
     lock_row(session, Registration, registration_id)
-    registration = session.scalar(select(Registration).options(joinedload(Registration.match), joinedload(Registration.payment)).where(Registration.id == registration_id))
+    # populate_existing=True: same reasoning as review_payment/cancel_registration
+    # above — require_registration_access already loaded this Registration in
+    # the same session before the lock.
+    registration = session.scalar(
+        select(Registration).options(joinedload(Registration.match), joinedload(Registration.payment)).where(Registration.id == registration_id)
+        .execution_options(populate_existing=True)
+    )
     if not registration: raise api_error(404, "RESOURCE_NOT_FOUND", "Registration not found")
     if registration.status != WAITLISTED: raise api_error(409, "INVALID_STATE_TRANSITION", "Only waitlisted players can be promoted")
     # Preserve FIFO: only the oldest eligible entry can be promoted.
@@ -860,8 +941,14 @@ def assign_team_member(session: Session, team: Team, registration: Registration,
         raise api_error(409, "CROSS_EVENT_REGISTRATION", "This registration does not belong to this event")
     begin_serialized_write(session)
     lock_row(session, Team, team.id)
-    team = session.get(Team, team.id)
-    registration = session.get(Registration, registration.id)
+    # populate_existing=True: both `team` and `registration` were already
+    # loaded by the router (via require_team_access / session.get) in this
+    # same session before the lock — a plain session.get() here wouldn't
+    # even issue a query, just return those pre-lock objects unchanged. See
+    # _load_registration_for_payment's docstring for the identical bug class
+    # this caused (and was reproduced against real PostgreSQL) elsewhere.
+    team = session.get(Team, team.id, populate_existing=True)
+    registration = session.get(Registration, registration.id, populate_existing=True)
     if registration.status != CONFIRMED:
         raise api_error(409, "REGISTRATION_NOT_CONFIRMED", "Only confirmed players can be assigned to a team")
     _assert_roster_unlocked(session, team.id)
@@ -900,8 +987,10 @@ def move_team_member(session: Session, member: TeamMember, new_team: Team, organ
     begin_serialized_write(session)
     lock_row(session, Team, first_id)
     lock_row(session, Team, second_id)
-    member = session.get(TeamMember, member.id)
-    new_team = session.get(Team, new_team.id)
+    # populate_existing=True: see assign_team_member's comment above — both
+    # objects were already loaded by the router before these locks.
+    member = session.get(TeamMember, member.id, populate_existing=True)
+    new_team = session.get(Team, new_team.id, populate_existing=True)
     _assert_roster_unlocked(session, old_team_id)
     _assert_roster_unlocked(session, new_team.id)
     if new_team.max_size is not None and team_member_count(session, new_team.id) >= new_team.max_size:
@@ -1042,15 +1131,280 @@ def player_fixtures_response(session: Session, match: Match, user: User) -> list
         select(Fixture).options(joinedload(Fixture.team_a), joinedload(Fixture.team_b))
         .where(Fixture.event_id == match.id).order_by(Fixture.scheduled_at)
     ).unique().all()
+    fixture_ids = [f.id for f in fixtures]
+
+    # Batched (not per-fixture) lookups — a fixed number of extra queries
+    # regardless of how many fixtures this event has, matching the same
+    # N+1-avoidance requirement Phase 4's team/fixture list endpoints follow.
+    results_by_fixture: dict[int, MatchResult] = {}
+    my_participation: set[int] = set()
+    if fixture_ids:
+        results_by_fixture = {
+            r.fixture_id: r for r in session.scalars(select(MatchResult).where(MatchResult.fixture_id.in_(fixture_ids))).all()
+        }
+        if registration:
+            my_participation = set(session.scalars(
+                select(MatchParticipant.fixture_id).where(
+                    MatchParticipant.fixture_id.in_(fixture_ids), MatchParticipant.registration_id == registration.id,
+                )
+            ))
+
+    winning_team_ids = {r.winning_team_id for r in results_by_fixture.values() if r.winning_team_id is not None}
+    teams_by_id = {t.id: t for t in session.scalars(select(Team).where(Team.id.in_(winning_team_ids))).all()} if winning_team_ids else {}
+    award_registration_ids = {
+        rid for r in results_by_fixture.values()
+        for rid in (r.player_of_match_registration_id, r.best_batter_registration_id, r.best_bowler_registration_id)
+        if rid is not None
+    }
+    registrations_by_id = (
+        {r.id: r for r in session.scalars(select(Registration).where(Registration.id.in_(award_registration_ids))).all()}
+        if award_registration_ids else {}
+    )
+
+    def result_summary(fixture_id: int) -> dict | None:
+        result = results_by_fixture.get(fixture_id)
+        if not result:
+            return None
+        winning_team = teams_by_id.get(result.winning_team_id) if result.winning_team_id else None
+
+        def award_name(registration_id: int | None) -> str | None:
+            award_registration = registrations_by_id.get(registration_id) if registration_id else None
+            return award_registration.name if award_registration else None
+
+        return {
+            "result_type": result.result_type,
+            "winning_team": {"id": winning_team.id, "name": winning_team.name, "short_code": winning_team.short_code} if winning_team else None,
+            "player_of_match_name": award_name(result.player_of_match_registration_id),
+            "best_batter_name": award_name(result.best_batter_registration_id),
+            "best_bowler_name": award_name(result.best_bowler_registration_id),
+            "participated": fixture_id in my_participation,
+        }
+
     return [
         {
             "id": f.id, "sequence": f.sequence, "scheduled_at": f.scheduled_at, "venue_override": f.venue_override,
             "status": f.status, "team_a": {"id": f.team_a.id, "name": f.team_a.name, "short_code": f.team_a.short_code},
             "team_b": {"id": f.team_b.id, "name": f.team_b.name, "short_code": f.team_b.short_code},
             "my_team_id": my_team_id if my_team_id in (f.team_a_id, f.team_b_id) else None,
+            "result": result_summary(f.id),
         }
         for f in fixtures
     ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: post-match Results, Awards, and Participation. No automatic
+# computation anywhere in this block — every field here is organizer-entered.
+# Award fields are validated against MatchParticipant (not Registration
+# directly), both in Python (for a clean 422) and via composite FK (the real
+# backstop — see models.MatchResult's docstring).
+# ---------------------------------------------------------------------------
+
+def _assert_fixture_completed(fixture: Fixture) -> None:
+    if fixture.status != "COMPLETED":
+        raise api_error(409, "FIXTURE_NOT_COMPLETED", "A result can only be recorded for a completed match")
+
+
+def _validate_result_payload(session: Session, fixture: Fixture, payload: MatchResultCreate) -> None:
+    if payload.result_type == "TEAM_A_WIN" and payload.winning_team_id != fixture.team_a_id:
+        raise api_error(422, "VALIDATION_ERROR", "Winning team must be Team A for a TEAM_A_WIN result")
+    if payload.result_type == "TEAM_B_WIN" and payload.winning_team_id != fixture.team_b_id:
+        raise api_error(422, "VALIDATION_ERROR", "Winning team must be Team B for a TEAM_B_WIN result")
+    participant_registration_ids = set(session.scalars(
+        select(MatchParticipant.registration_id).where(MatchParticipant.fixture_id == fixture.id)
+    ))
+    for value in (payload.player_of_match_registration_id, payload.best_batter_registration_id, payload.best_bowler_registration_id):
+        if value is not None and value not in participant_registration_ids:
+            raise api_error(422, "VALIDATION_ERROR", "Award recipients must be recorded as participants in this match first")
+
+
+def create_match_result(session: Session, fixture: Fixture, payload: MatchResultCreate, organizer: Organizer) -> MatchResult:
+    """Locks the same Fixture row set_match_participants locks, for the same
+    reason: without it, a participant that _validate_result_payload just
+    confirmed as eligible could be concurrently removed by a racing
+    set_match_participants call before this function's own insert commits —
+    the composite FK would still correctly reject the resulting write, but
+    as a raw, unhandled IntegrityError (500) instead of a clean error, and
+    the two operations would otherwise interleave non-deterministically.
+    Locking Fixture first serializes them completely."""
+    begin_serialized_write(session)
+    lock_row(session, Fixture, fixture.id)
+    # populate_existing=True: `fixture` was already loaded by the router's
+    # require_fixture_access dependency in this same session before the
+    # lock — see _load_registration_for_payment's docstring for why a plain
+    # re-fetch here would otherwise silently keep serving that stale object.
+    fixture = session.get(Fixture, fixture.id, populate_existing=True)
+    _assert_fixture_completed(fixture)
+    _validate_result_payload(session, fixture, payload)
+    result = MatchResult(
+        fixture_id=fixture.id, event_id=fixture.event_id, team_a_id=fixture.team_a_id, team_b_id=fixture.team_b_id,
+        winning_team_id=payload.winning_team_id, result_type=payload.result_type,
+        player_of_match_registration_id=payload.player_of_match_registration_id,
+        best_batter_registration_id=payload.best_batter_registration_id,
+        best_bowler_registration_id=payload.best_bowler_registration_id,
+        notes=payload.notes, finalized_at=now_ist(), finalized_by_organizer_id=organizer.id,
+    )
+    session.add(result)
+    try:
+        session.flush()
+    except IntegrityError:
+        # The DB's own backstop — uq_match_result_fixture — catching a race
+        # this should already be rare in practice (no lock needed: a plain
+        # unique-constraint-and-catch is the same pattern create_team uses
+        # for its name-uniqueness race).
+        session.rollback()
+        raise api_error(409, "RESULT_ALREADY_EXISTS", "A result has already been recorded for this match")
+    audit(
+        session, "RESULT_CREATED", "match_result", result.id,
+        {"fixture_id": fixture.id, "result_type": result.result_type}, actor_type="ORGANIZER", actor_id=organizer.id,
+    )
+    session.commit(); session.refresh(result)
+    logger.info("match_result_created fixture_id=%s result_type=%s", fixture.id, result.result_type)
+    return result
+
+
+def update_match_result(session: Session, result: MatchResult, fixture: Fixture, payload: MatchResultUpdate, organizer: Organizer) -> MatchResult:
+    """Corrections remain allowed indefinitely — finalized_at/
+    finalized_by_organizer_id are informational only (set once, at
+    creation), never a lock, per the explicit "do not make the result
+    unnecessarily immutable" instruction.
+
+    Locks Fixture — same reasoning and target as create_match_result and
+    set_match_participants: without it, a concurrent set_match_participants
+    call could remove the very participant this update is about to award,
+    between _validate_result_payload's check and this function's own write."""
+    begin_serialized_write(session)
+    lock_row(session, Fixture, fixture.id)
+    fixture = session.get(Fixture, fixture.id, populate_existing=True)
+    result = session.get(MatchResult, result.id, populate_existing=True)
+    _validate_result_payload(session, fixture, payload)
+    before = {"result_type": result.result_type, "winning_team_id": result.winning_team_id}
+    result.result_type = payload.result_type
+    result.winning_team_id = payload.winning_team_id
+    result.player_of_match_registration_id = payload.player_of_match_registration_id
+    result.best_batter_registration_id = payload.best_batter_registration_id
+    result.best_bowler_registration_id = payload.best_bowler_registration_id
+    result.notes = payload.notes
+    try:
+        session.flush()
+    except IntegrityError:
+        # Same backstop as create_match_result — a validated-then-invalidated
+        # award (see docstring) or any other constraint violation surfaces
+        # as a clean error, never a raw 500.
+        session.rollback()
+        raise api_error(422, "VALIDATION_ERROR", "Invalid result data — a selected award recipient may no longer be a participant in this match")
+    audit(
+        session, "RESULT_UPDATED", "match_result", result.id, {"fields": sorted(payload.model_dump())},
+        actor_type="ORGANIZER", actor_id=organizer.id, before=before,
+        after={"result_type": result.result_type, "winning_team_id": result.winning_team_id},
+    )
+    session.commit(); session.refresh(result)
+    return result
+
+
+def match_result_to_response(session: Session, result: MatchResult) -> dict:
+    teams = {t.id: t for t in session.scalars(select(Team).where(Team.id.in_((result.team_a_id, result.team_b_id)))).all()}
+    award_ids = [
+        rid for rid in (result.player_of_match_registration_id, result.best_batter_registration_id, result.best_bowler_registration_id)
+        if rid is not None
+    ]
+    registrations = (
+        {r.id: r for r in session.scalars(select(Registration).where(Registration.id.in_(award_ids))).all()} if award_ids else {}
+    )
+
+    def team_summary(team_id: int | None) -> dict | None:
+        team = teams.get(team_id) if team_id else None
+        return {"id": team.id, "name": team.name, "short_code": team.short_code} if team else None
+
+    def award_summary(registration_id: int | None) -> dict | None:
+        registration = registrations.get(registration_id) if registration_id else None
+        return {"registration_id": registration_id, "name": registration.name} if registration else None
+
+    return {
+        "id": result.id, "fixture_id": result.fixture_id, "result_type": result.result_type,
+        "winning_team": team_summary(result.winning_team_id),
+        "player_of_match": award_summary(result.player_of_match_registration_id),
+        "best_batter": award_summary(result.best_batter_registration_id),
+        "best_bowler": award_summary(result.best_bowler_registration_id),
+        "notes": result.notes, "finalized_at": result.finalized_at,
+        "created_at": result.created_at, "updated_at": result.updated_at,
+    }
+
+
+def match_participant_to_response(participant: MatchParticipant) -> dict:
+    return {
+        "id": participant.id, "registration_id": participant.registration_id, "team_id": participant.team_id,
+        "player_name": participant.registration.name, "participation_status": participant.participation_status,
+    }
+
+
+def match_participants_response(session: Session, fixture: Fixture) -> list[dict]:
+    participants = session.scalars(
+        select(MatchParticipant).options(joinedload(MatchParticipant.registration))
+        .where(MatchParticipant.fixture_id == fixture.id).order_by(MatchParticipant.created_at)
+    ).all()
+    return [match_participant_to_response(p) for p in participants]
+
+
+def set_match_participants(session: Session, fixture: Fixture, entries: list[MatchParticipantEntry], organizer: Organizer) -> list[dict]:
+    """Replaces the whole participant set for this fixture in one
+    transaction — the explicit "participant updates are transactional"
+    requirement. Locked on the Fixture row (the resource this whole
+    diff-and-replace operation is about), the one place in this phase a
+    lock is actually needed: unlike create_match_result's simple unique-
+    constraint race, two concurrent full-set replacements racing here could
+    otherwise interleave their deletes/inserts inconsistently."""
+    _assert_fixture_completed(fixture)
+    begin_serialized_write(session)
+    lock_row(session, Fixture, fixture.id)
+    fixture = session.get(Fixture, fixture.id, populate_existing=True)
+    valid_team_ids = (fixture.team_a_id, fixture.team_b_id)
+    seen_registration_ids: set[int] = set()
+    for entry in entries:
+        if entry.registration_id in seen_registration_ids:
+            raise api_error(422, "VALIDATION_ERROR", "Duplicate registration in participant list")
+        seen_registration_ids.add(entry.registration_id)
+        if entry.team_id not in valid_team_ids:
+            raise api_error(422, "VALIDATION_ERROR", "Team does not belong to this match")
+        registration = session.get(Registration, entry.registration_id)
+        if not registration or registration.match_id != fixture.event_id:
+            raise api_error(422, "VALIDATION_ERROR", "Registration does not belong to this event")
+        member = session.scalar(
+            select(TeamMember).where(TeamMember.registration_id == entry.registration_id, TeamMember.team_id == entry.team_id)
+        )
+        if not member:
+            raise api_error(422, "VALIDATION_ERROR", "This player is not a member of the selected team")
+
+    existing = {
+        p.registration_id: p for p in session.scalars(select(MatchParticipant).where(MatchParticipant.fixture_id == fixture.id))
+    }
+    desired_ids = {entry.registration_id for entry in entries}
+
+    for registration_id, participant in existing.items():
+        if registration_id not in desired_ids:
+            session.delete(participant)
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        raise api_error(409, "PARTICIPANT_IS_AWARD_RECIPIENT", "Remove this player's award before removing them from participation")
+
+    for entry in entries:
+        if entry.registration_id not in existing:
+            session.add(MatchParticipant(fixture_id=fixture.id, registration_id=entry.registration_id, team_id=entry.team_id, event_id=fixture.event_id))
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        raise api_error(409, "DUPLICATE_PARTICIPANT", "A participant entry could not be saved")
+
+    audit(
+        session, "PARTICIPATION_UPDATED", "fixture", fixture.id, {"participant_count": len(entries)},
+        actor_type="ORGANIZER", actor_id=organizer.id,
+    )
+    session.commit()
+    logger.info("match_participation_updated fixture_id=%s count=%s", fixture.id, len(entries))
+    return match_participants_response(session, fixture)
 
 
 def backfill_missing_event_ownership(session: Session) -> None:

@@ -178,6 +178,60 @@ layer entirely raises `IntegrityError` on both dialects when it violates this
 `tests/test_fixtures.py::test_database_itself_rejects_cross_event_fixture`,
 the latter two gated on `SC_TEST_DATABASE_URL` for the real-PostgreSQL run).
 
+## Phase 5: MatchParticipant / MatchResult composite FKs
+
+Two more composite-FK targets were added to *existing* tables:
+`UNIQUE(id, event_id)` on `fixtures`, and `UNIQUE(registration_id, team_id)`
+on `team_members` (alongside its pre-existing single-column
+`UNIQUE(registration_id)` — a registration is still on at most one team
+ever; this second constraint exists purely as an additional composite-FK
+target).
+
+`match_participants` chains four composite FKs together: `team_id`/`event_id`
+into `teams`, `registration_id`/`event_id` into `registrations`,
+`fixture_id`/`event_id` into `fixtures`, and — the one that goes further
+than `team_members` itself needs — `registration_id`/`team_id` into
+`team_members(registration_id, team_id)`, which proves the participant was
+genuinely assigned to the team they're recorded as playing for, not just
+that both independently belong to the right event.
+
+`match_results` then reuses `match_participants` as *its* composite-FK
+target for all three award fields (`player_of_match_registration_id`,
+`best_batter_registration_id`, `best_bowler_registration_id`), each as
+`(award_registration_id, fixture_id) -> match_participants(registration_id,
+fixture_id)`. Because SQL's multi-column FK semantics skip the check
+whenever any referencing column is NULL, an unset award is simply
+unconstrained — a *set* award must reference a real participation row for
+that exact fixture. **VERIFIED LOCALLY** on both SQLite and PostgreSQL that
+NULL correctly skips the check while a set, invalid value is rejected
+(a minimal standalone repro, before relying on it in the real schema) —
+plus the same direct-insert-bypassing-the-service-layer proof used above,
+in `tests/test_match_results.py::test_database_itself_rejects_a_non_participant_award`
+and `tests/test_match_participants.py::test_database_itself_rejects_wrong_team_participant`.
+
+`match_results.winning_team_id` consistency with `result_type` is a single
+same-row `CHECK` constraint (see `architecture.md`) — the only new schema
+invariant this phase needs that isn't a foreign key.
+
+## Row-locking correction (Phase 5)
+
+Two pre-existing functions locked the wrong row for a capacity-dependent
+decision: `review_payment` and `promote_waitlisted` locked the individual
+`Payment`/`Registration` being acted on, not the `Match` whose capacity the
+decision actually depends on. Fixed to lock `Match` first (a cheap unlocked
+lookup of `match_id`, then `lock_row(Match, ...)` before the original lock),
+matching `create_registration`'s already-correct choice. See
+`architecture.md`'s Phase 5 section for the full investigation and evidence.
+
+Separately, several "load an object, lock a row, reload the object" call
+sites were re-querying an object already present in the session's identity
+map and — since this app's `sessionmaker` sets `expire_on_commit=False` —
+getting back the same, pre-lock, stale data rather than a fresh read.
+Fixed by adding `populate_existing=True` (or `session.get(...,
+populate_existing=True)`) to every such reload:
+`_load_registration_for_payment`, `create_registration`, `review_payment`,
+`promote_waitlisted`, `assign_team_member`, `move_team_member`.
+
 ## JSONB
 
 `audit_logs.metadata_json/before_json/after_json` use `JSONB` on

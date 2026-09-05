@@ -47,6 +47,22 @@ FIXTURE_STATUSES = ("SCHEDULED", "IN_PROGRESS", "COMPLETED", "CANCELLED")
 # reaches one of these statuses.
 FIXTURE_ROSTER_LOCKING_STATUSES = ("IN_PROGRESS", "COMPLETED")
 
+# Phase 5: the organizer's manually-entered outcome of a completed match. No
+# automatic computation, ever — see MatchResult below.
+RESULT_TYPES = ("TEAM_A_WIN", "TEAM_B_WIN", "DRAW", "NO_RESULT")
+# Deliberately a single value for now (see MatchParticipant) — a real column
+# so a future distinction (e.g. an unused substitute) doesn't require a
+# migration, without inventing meaning that doesn't exist yet.
+PARTICIPATION_STATUSES = ("PLAYED",)
+
+
+def _sql_in_tuple(values: tuple[str, ...]) -> str:
+    """Python's tuple repr — used elsewhere in this file for CHECK
+    constraints, e.g. f"status IN {ALL_REGISTRATION_STATUSES}" — renders a
+    single-element tuple as ('X',), a trailing comma that is invalid SQL.
+    This renders correctly for any length, including one."""
+    return "(" + ", ".join(f"'{v}'" for v in values) + ")"
+
 
 class Base(DeclarativeBase):
     pass
@@ -329,6 +345,11 @@ class TeamMember(Base):
     __tablename__ = "team_members"
     __table_args__ = (
         UniqueConstraint("registration_id", name="uq_team_member_registration"),
+        # Redundant with the single-column unique above (registration_id is
+        # already unique table-wide), but this composite is the Phase 5
+        # composite-FK target that proves "this registration is genuinely a
+        # member of this specific team" — see MatchParticipant.
+        UniqueConstraint("registration_id", "team_id", name="uq_team_member_registration_team"),
         ForeignKeyConstraint(["team_id", "event_id"], ["teams.id", "teams.event_id"], name="fk_team_member_team_event"),
         ForeignKeyConstraint(
             ["registration_id", "event_id"], ["registrations.id", "registrations.match_id"],
@@ -367,6 +388,8 @@ class Fixture(Base):
     """
     __tablename__ = "fixtures"
     __table_args__ = (
+        # Composite-FK target for MatchResult/MatchParticipant (Phase 5).
+        UniqueConstraint("id", "event_id", name="uq_fixture_id_event_id"),
         ForeignKeyConstraint(["team_a_id", "event_id"], ["teams.id", "teams.event_id"], name="fk_fixture_team_a_event"),
         ForeignKeyConstraint(["team_b_id", "event_id"], ["teams.id", "teams.event_id"], name="fk_fixture_team_b_event"),
         CheckConstraint("team_a_id != team_b_id", name="ck_fixture_teams_distinct"),
@@ -408,6 +431,119 @@ class Fixture(Base):
         primaryjoin="and_(Fixture.team_b_id == Team.id, Fixture.event_id == Team.event_id)",
         overlaps="event,fixtures,team_a",
     )
+
+
+class MatchParticipant(Base):
+    """A lightweight record answering exactly one question: did this
+    Registration actually play this Fixture, for which Team. Deliberately
+    small — no innings, substitutions, bench, or per-player stats (see
+    Phase 5 scope).
+
+    The four ForeignKeyConstraints below chain together to make every wrong
+    combination structurally impossible to insert: team_id and
+    registration_id must each independently belong to event_id (same
+    technique as TeamMember), fixture_id must also belong to event_id, and
+    — the one that goes further than TeamMember needs to — registration_id
+    and team_id together must correspond to a real, existing TeamMember row,
+    so a participant can never be recorded against a team the player was
+    never actually assigned to.
+    """
+    __tablename__ = "match_participants"
+    __table_args__ = (
+        # Also the composite-FK target MatchResult's award fields reference —
+        # see MatchResult below.
+        UniqueConstraint("fixture_id", "registration_id", name="uq_match_participant_fixture_registration"),
+        ForeignKeyConstraint(["team_id", "event_id"], ["teams.id", "teams.event_id"], name="fk_participant_team_event"),
+        ForeignKeyConstraint(
+            ["registration_id", "event_id"], ["registrations.id", "registrations.match_id"],
+            name="fk_participant_registration_event",
+        ),
+        ForeignKeyConstraint(["fixture_id", "event_id"], ["fixtures.id", "fixtures.event_id"], name="fk_participant_fixture_event"),
+        ForeignKeyConstraint(
+            ["registration_id", "team_id"], ["team_members.registration_id", "team_members.team_id"],
+            name="fk_participant_registration_team_member",
+        ),
+        CheckConstraint(f"participation_status IN {_sql_in_tuple(PARTICIPATION_STATUSES)}", name="ck_participant_status_valid"),
+        Index("ix_match_participants_fixture_id", "fixture_id"),
+        Index("ix_match_participants_event_id", "event_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    fixture_id: Mapped[int] = mapped_column(Integer)
+    registration_id: Mapped[int] = mapped_column(Integer)
+    team_id: Mapped[int] = mapped_column(Integer)
+    # Denormalized on purpose — required by the composite FKs above.
+    event_id: Mapped[int] = mapped_column(Integer)
+    participation_status: Mapped[str] = mapped_column(String(20), default="PLAYED")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
+
+    # Explicit primaryjoin: registration_id participates in two composite FKs
+    # (the one to registrations, and the one to team_members) — spelling out
+    # the join picks the registrations one unambiguously, same reasoning as
+    # Fixture.team_a/team_b above.
+    registration: Mapped[Registration] = relationship(
+        foreign_keys=[registration_id, event_id],
+        primaryjoin="and_(MatchParticipant.registration_id == Registration.id, MatchParticipant.event_id == Registration.match_id)",
+    )
+
+
+class MatchResult(Base):
+    """The organizer's manually-entered outcome of exactly one completed
+    Fixture. Never computed automatically — see services.create_match_result.
+
+    team_a_id/team_b_id are a denormalized snapshot of the fixture's teams
+    at the moment the result is first created, not a live reference — this
+    is what turns "the winner must be team A or team B, and a draw/no-result
+    must have no winner" into a single same-row CHECK constraint, rather
+    than a Python-only rule. The three award fields are each a composite FK
+    into MatchParticipant, not directly into Registration — an award can
+    only ever reference someone who has an actual MatchParticipant row for
+    this exact fixture; SQL's standard multi-column FK semantics mean a NULL
+    award (nothing selected) simply isn't checked at all, only a set one.
+    """
+    __tablename__ = "match_results"
+    __table_args__ = (
+        UniqueConstraint("fixture_id", name="uq_match_result_fixture"),
+        ForeignKeyConstraint(["fixture_id", "event_id"], ["fixtures.id", "fixtures.event_id"], name="fk_result_fixture_event"),
+        ForeignKeyConstraint(
+            ["player_of_match_registration_id", "fixture_id"],
+            ["match_participants.registration_id", "match_participants.fixture_id"],
+            name="fk_result_mvp_participant",
+        ),
+        ForeignKeyConstraint(
+            ["best_batter_registration_id", "fixture_id"],
+            ["match_participants.registration_id", "match_participants.fixture_id"],
+            name="fk_result_best_batter_participant",
+        ),
+        ForeignKeyConstraint(
+            ["best_bowler_registration_id", "fixture_id"],
+            ["match_participants.registration_id", "match_participants.fixture_id"],
+            name="fk_result_best_bowler_participant",
+        ),
+        CheckConstraint(f"result_type IN {RESULT_TYPES}", name="ck_result_type_valid"),
+        CheckConstraint(
+            "(result_type = 'TEAM_A_WIN' AND winning_team_id = team_a_id) OR "
+            "(result_type = 'TEAM_B_WIN' AND winning_team_id = team_b_id) OR "
+            "(result_type IN ('DRAW', 'NO_RESULT') AND winning_team_id IS NULL)",
+            name="ck_result_winner_consistent",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    fixture_id: Mapped[int] = mapped_column(Integer)
+    event_id: Mapped[int] = mapped_column(Integer)
+    team_a_id: Mapped[int] = mapped_column(Integer)
+    team_b_id: Mapped[int] = mapped_column(Integer)
+    winning_team_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    result_type: Mapped[str] = mapped_column(String(20))
+    player_of_match_registration_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    best_batter_registration_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    best_bowler_registration_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finalized_by_organizer_id: Mapped[int | None] = mapped_column(ForeignKey("organizers.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist, onupdate=now_ist)
 
 
 class Organizer(Base):

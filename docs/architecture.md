@@ -119,3 +119,71 @@ any redesign here; the roster-lock rule above is what makes "who was
 actually on the team when it played" a trustworthy fact by the time such a
 phase needs to read it, without a per-fixture roster snapshot table that
 nothing needs yet.
+
+## Phase 5: post-match Results, Awards, and Participation
+
+Once a match (Fixture) reaches `COMPLETED`, an organizer can manually record
+what happened — never computed automatically:
+
+```
+Fixture (COMPLETED) -> MatchParticipant ("who actually played, for which team") -> MatchResult (winner/MVP/Best Batter/Best Bowler/notes)
+```
+
+Extending the Phase 4 chain: `Event -> Registration -> TeamMember -> Fixture
+-> MatchParticipant -> MatchResult`.
+
+- **MatchParticipant**: a lightweight per-fixture roster fact, deliberately
+  smaller than a real scoring system — no innings, substitutions, bench, or
+  stats. Its existence for a given (fixture, registration) pair *is* "this
+  player played this match."
+- **MatchResult**: one per fixture (`UNIQUE(fixture_id)`), organizer-entered
+  only — `result_type` (`TEAM_A_WIN`/`TEAM_B_WIN`/`DRAW`/`NO_RESULT`), an
+  optional winner, and three optional awards (MVP, Best Batter, Best
+  Bowler). Corrections remain allowed indefinitely — there is no "locked"
+  state; `finalized_at`/`finalized_by_organizer_id` are informational only,
+  the same role `Payment.verified_at` already plays elsewhere.
+- **Award eligibility is a database fact, not just a Python check**: each
+  award field is a composite foreign key into `match_participants`
+  (`(award_registration_id, fixture_id) -> match_participants(registration_id,
+  fixture_id)`), not directly into `registrations`. Since SQL's standard
+  multi-column FK semantics skip the check when any referencing column is
+  NULL, an unset award is unconstrained — but a *set* one can only ever name
+  someone with a real participation row for this exact fixture. See
+  `database.md` for the full composite-FK chain, including the new
+  `team_members(registration_id, team_id)` target that proves a participant
+  was genuinely assigned to the team they're recorded as playing for.
+- **Winner consistency is also a same-row database `CHECK`**, not only
+  application logic: `MatchResult` snapshots `team_a_id`/`team_b_id` from
+  the fixture at creation time specifically so "a `TEAM_A_WIN` must have
+  `winning_team_id = team_a_id`" and "a draw/no-result must have a NULL
+  winner" can be expressed as one `CHECK` constraint.
+- **Realtime**: `MATCH_RESULT_CREATED`, `MATCH_RESULT_UPDATED`,
+  `MATCH_PARTICIPATION_UPDATED` — same broadcaster, no new mechanism.
+- **Explicitly not built**: Media Hub, photo/media uploads, Instagram/Reels/
+  CricHeroes integration, live/ball-by-ball scoring, scorecards, rankings,
+  Elo, leaderboards, AI analytics. Those remain later, separate phases.
+
+### A concurrency-correctness finding from this phase, fixed on the spot
+
+Investigating pre-existing intermittent test flakiness in the payment
+domain (unrelated to this phase's new tables) surfaced two real bugs in
+`services.py`, both fixed and re-verified against real PostgreSQL:
+
+1. **Identity-map staleness**: `submit_payment_proof` (and several other
+   "load, lock, reload" call sites, including this session's own Phase 4
+   team-assignment code) re-queried an object already present in the
+   session's identity map, expecting fresh post-lock data. With
+   `expire_on_commit=False`, SQLAlchemy does not refresh an already-loaded
+   object's columns or relationship collections on a plain re-`select()` —
+   only `populate_existing=True` does. Fixed everywhere this pattern
+   appears.
+2. **Wrong lock target**: `review_payment`/`promote_waitlisted` locked the
+   individual `Payment`/`Registration` row being acted on, not the `Match`
+   the capacity decision is actually about — letting two different payments
+   for the same nearly-full event both read the same under-capacity
+   snapshot and both confirm. Fixed by locking `Match` first, matching
+   `create_registration`'s already-correct precedent.
+
+Both were reproduced deterministically before the fix and could not be
+reproduced afterward (25/25 and 6/6 clean runs respectively) — see the
+Phase 5 delivery report for the full evidence.

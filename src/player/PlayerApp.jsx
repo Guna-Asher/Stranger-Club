@@ -51,7 +51,7 @@ export default function PlayerApp({ publicId }) {
     // Phase 4: team/match changes are notified the same way — the payload
     // itself is never trusted, only used as a signal to refetch (see
     // deps.publish_event_update / services.py).
-    for (const kind of ['TEAM_CREATED', 'TEAM_UPDATED', 'TEAM_REMOVED', 'TEAM_MEMBER_ASSIGNED', 'TEAM_MEMBER_MOVED', 'TEAM_MEMBER_REMOVED', 'FIXTURE_CREATED', 'FIXTURE_UPDATED', 'FIXTURE_STATUS_CHANGED']) {
+    for (const kind of ['TEAM_CREATED', 'TEAM_UPDATED', 'TEAM_REMOVED', 'TEAM_MEMBER_ASSIGNED', 'TEAM_MEMBER_MOVED', 'TEAM_MEMBER_REMOVED', 'FIXTURE_CREATED', 'FIXTURE_UPDATED', 'FIXTURE_STATUS_CHANGED', 'MATCH_RESULT_CREATED', 'MATCH_RESULT_UPDATED', 'MATCH_PARTICIPATION_UPDATED']) {
       stream.addEventListener(kind, () => load());
     }
     return () => stream.close();

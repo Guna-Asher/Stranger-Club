@@ -20,8 +20,25 @@ export default function PlayerStatus({ match, registration, teamInfo, fixtures, 
   const myTeam = confirmed ? teamInfo?.team : null;
   const upcomingFixture = confirmed ? fixtures?.find((f) => f.my_team_id && (f.status === 'SCHEDULED' || f.status === 'IN_PROGRESS')) : null;
   const opponent = upcomingFixture && (upcomingFixture.team_a.id === upcomingFixture.my_team_id ? upcomingFixture.team_b : upcomingFixture.team_a);
+  const completedFixtures = confirmed ? (fixtures || []).filter((f) => f.my_team_id && f.status === 'COMPLETED' && f.result) : [];
   return <section className="status-page"><button className="back" onClick={back}><ArrowLeft /> MATCH DETAILS</button><div className={cn('status-icon', confirmed && 'success', rejected && 'danger')}><CheckCircle2 /></div><p className="eyebrow">{dateText(match.date)}</p><h1>{content[0]}</h1><p>{content[1]}</p><div className="ticket"><div><b>{match.name}</b><span>{timeText(match.start_time)} · {match.venue}</span></div><Status status={playerStatus(registration)} /><footer><small>PAYMENT</small><strong>{confirmed ? `₹${registration.payment?.amount_due}` : submitted ? 'VERIFYING' : waitlisted ? 'WAITLISTED' : cancelled ? '—' : 'REUPLOAD'}</strong></footer></div>
     {myTeam && <div className="ticket"><div><b>YOUR TEAM: {myTeam.name.toUpperCase()}</b><span>{teamInfo.teammates.length === 0 ? 'No teammates assigned yet' : teamInfo.teammates.map((t) => t.name).join(', ')}</span></div></div>}
     {upcomingFixture && <div className="ticket"><div><b>VS {opponent.name.toUpperCase()}</b><span>{dateText(upcomingFixture.scheduled_at.slice(0, 10))} · {timeText(upcomingFixture.scheduled_at.slice(11, 16))} · {upcomingFixture.venue_override || match.venue}</span></div><Status status={upcomingFixture.status} /></div>}
+    {completedFixtures.map((f) => (
+      <div className="ticket" key={f.id}>
+        <div>
+          <b>{f.result.result_type === 'DRAW' ? 'MATCH DRAWN' : f.result.result_type === 'NO_RESULT' ? 'NO RESULT' : f.result.winning_team?.id === f.my_team_id ? 'YOUR TEAM WON' : `${f.result.winning_team?.name.toUpperCase()} WON`}</b>
+          <span>{f.team_a.name} vs {f.team_b.name} · {dateText(f.scheduled_at.slice(0, 10))}</span>
+        </div>
+        {(f.result.player_of_match_name || f.result.best_batter_name || f.result.best_bowler_name) && (
+          <p className="quiet">
+            {f.result.player_of_match_name && `Player of the Match: ${f.result.player_of_match_name}. `}
+            {f.result.best_batter_name && `Best Batter: ${f.result.best_batter_name}. `}
+            {f.result.best_bowler_name && `Best Bowler: ${f.result.best_bowler_name}.`}
+          </p>
+        )}
+        <footer><small>YOU PLAYED</small><strong>{f.result.participated ? 'YES' : 'NO'}</strong></footer>
+      </div>
+    ))}
     {confirmed && <button className="primary-button" onClick={calendar}><CalendarPlus /> ADD TO CALENDAR</button>}{submitted && <button className="primary-button" onClick={refresh}>REFRESH STATUS</button>}{rejected && <button className="primary-button" onClick={retry}>UPLOAD NEW PROOF</button>}{cancelled && <button className="primary-button" onClick={rejoin}>JOIN AGAIN<ChevronRight /></button>}{cancellable && <button className="ghost-button" onClick={() => setConfirming(true)}>CANCEL REGISTRATION</button>}<button className="ghost-button" onClick={share}><Share2 /> SHARE MATCH</button>{confirming && <CancelConfirm close={() => setConfirming(false)} confirm={cancelRegistration} busy={busy} />}</section>;
 }

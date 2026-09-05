@@ -11,6 +11,7 @@ EventStatus = Literal["DRAFT", "OPEN", "FULL", "ONGOING", "COMPLETED", "CANCELLE
 # Internal name only — see models.Fixture's docstring. Every user-facing
 # string still says "Match"/"Matches".
 FixtureStatus = Literal["SCHEDULED", "IN_PROGRESS", "COMPLETED", "CANCELLED"]
+ResultType = Literal["TEAM_A_WIN", "TEAM_B_WIN", "DRAW", "NO_RESULT"]
 
 UPI_ID_PATTERN = re.compile(r"^[a-zA-Z0-9.\-]{2,256}@[a-zA-Z][a-zA-Z]{1,64}$")
 
@@ -437,6 +438,15 @@ class PlayerTeamResponse(BaseModel):
     teammates: list[PlayerTeammate] = []
 
 
+class PlayerMatchResultSummary(BaseModel):
+    result_type: str
+    winning_team: TeamSummary | None = None
+    player_of_match_name: str | None = None
+    best_batter_name: str | None = None
+    best_bowler_name: str | None = None
+    participated: bool = False
+
+
 class PlayerFixtureResponse(BaseModel):
     id: int
     sequence: int | None = None
@@ -446,3 +456,73 @@ class PlayerFixtureResponse(BaseModel):
     team_a: TeamSummary
     team_b: TeamSummary
     my_team_id: int | None = None
+    result: PlayerMatchResultSummary | None = None
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: post-match Results, Awards, and Participation
+# ---------------------------------------------------------------------------
+
+class MatchParticipantEntry(BaseModel):
+    registration_id: int
+    team_id: int
+
+
+class MatchParticipantResponse(BaseModel):
+    id: int
+    registration_id: int
+    team_id: int
+    player_name: str
+    participation_status: str = "PLAYED"
+
+
+class MatchAwardSummary(BaseModel):
+    registration_id: int
+    name: str
+
+
+class MatchResultCreate(BaseModel):
+    result_type: ResultType
+    winning_team_id: int | None = None
+    player_of_match_registration_id: int | None = None
+    best_batter_registration_id: int | None = None
+    best_bowler_registration_id: int | None = None
+    notes: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def blank_notes_is_none(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("winning_team_id")
+    @classmethod
+    def winner_matches_result_type(cls, value: int | None, info) -> int | None:
+        result_type = info.data.get("result_type")
+        if result_type in ("TEAM_A_WIN", "TEAM_B_WIN") and value is None:
+            raise ValueError("Select the winning team")
+        if result_type in ("DRAW", "NO_RESULT") and value is not None:
+            raise ValueError("A draw or no-result cannot have a winning team")
+        return value
+
+
+class MatchResultUpdate(MatchResultCreate):
+    """Same full-shape schema as Create, deliberately not a granular patch:
+    the organizer UI's one SAVE RESULT button always resubmits the whole
+    form, and result_type/winning_team_id are too tightly coupled for a
+    partial update of just one of them to mean anything."""
+
+
+class MatchResultResponse(BaseModel):
+    id: int
+    fixture_id: int
+    result_type: str
+    winning_team: TeamSummary | None = None
+    player_of_match: MatchAwardSummary | None = None
+    best_batter: MatchAwardSummary | None = None
+    best_bowler: MatchAwardSummary | None = None
+    notes: str | None = None
+    finalized_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { LoaderCircle, Plus } from 'lucide-react';
+import MatchResult from './MatchResult';
 import Status from '../components/Status';
 import { api } from '../lib/api';
 import { dateText, timeText } from '../lib/format';
@@ -71,6 +72,7 @@ export default function Matches({ match, toast }) {
               <button onClick={() => setStatus(fixture, 'CANCELLED')}>CANCEL MATCH</button>
             </div>
           )}
+          {fixture.status === 'COMPLETED' && <MatchResult fixture={fixture} eventId={match.id} toast={toast} />}
         </section>
       ))}
       {teams.length < 2 ? (
