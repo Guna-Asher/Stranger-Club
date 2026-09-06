@@ -11,10 +11,21 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from fastapi.testclient import TestClient
 
+from backend.app.deps import AVATAR_CHANGE_LIMIT
 from tests.test_api import client
 from tests.test_player_dashboard import player_client_for
 
 __all__ = ["client"]
+
+
+def test_avatar_change_rate_limit(client: TestClient):
+    player, headers = player_client_for(client, "9600000099")
+    for design_id in range(AVATAR_CHANGE_LIMIT):
+        response = player.put("/api/player/avatar", json={"design_id": design_id}, headers=headers)
+        assert response.status_code == 200, response.json()
+    limited = player.put("/api/player/avatar", json={"design_id": AVATAR_CHANGE_LIMIT}, headers=headers)
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "RATE_LIMITED"
 
 
 def test_new_player_has_no_avatar_until_they_pick_one(client: TestClient):

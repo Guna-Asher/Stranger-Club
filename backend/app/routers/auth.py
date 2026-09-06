@@ -21,6 +21,14 @@ router = APIRouter()
 LOGIN_FAILURE_LIMIT = 8
 LOGIN_FAILURE_WINDOW_SECONDS = 900
 
+# A precomputed Argon2 hash of an arbitrary value, verified against (and
+# always failing) whenever the submitted username doesn't resolve to an
+# active organizer. Argon2 is deliberately slow/memory-hard; skipping that
+# work entirely for a nonexistent username would make the login endpoint's
+# response time a timing side-channel an attacker could use to enumerate
+# valid organizer usernames without ever needing a correct password.
+_DUMMY_PASSWORD_HASH = PASSWORD_HASHER.hash(secrets.token_urlsafe(32))
+
 
 @router.post("/api/auth/login", response_model=AuthResponse)
 def login(payload: LoginRequest, request: Request, response: Response, session: Session = Depends(get_session)):
@@ -43,6 +51,12 @@ def login(payload: LoginRequest, request: Request, response: Response, session: 
     if organizer and organizer.is_active:
         try: valid = PASSWORD_HASHER.verify(organizer.password_hash, payload.password)
         except VerifyMismatchError: valid = False
+    else:
+        # Burn the same Argon2 cost a real verify would take, so a
+        # nonexistent/inactive username can't be distinguished from a wrong
+        # password by response time alone.
+        try: PASSWORD_HASHER.verify(_DUMMY_PASSWORD_HASH, payload.password)
+        except VerifyMismatchError: pass
     if not valid:
         try:
             record_rate_limit_attempt_db(session, key, LOGIN_FAILURE_WINDOW_SECONDS)

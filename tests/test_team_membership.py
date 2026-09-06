@@ -8,6 +8,7 @@ against real PostgreSQL when SC_TEST_DATABASE_URL is set.
 from __future__ import annotations
 
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -220,6 +221,79 @@ def test_roster_locks_once_team_has_played(client: TestClient):
     move = client.patch(f"/api/admin/team-members/{member_id}", json={"team_id": team_b["id"]}, headers=headers)
     assert move.status_code == 409
     assert move.json()["error"]["code"] == "TEAM_ROSTER_LOCKED"
+
+
+def test_remove_team_member_and_update_fixture_contend_for_the_same_lock(client: TestClient):
+    """update_fixture (transitioning into a roster-locking status) and
+    remove_team_member must serialize against each other — otherwise a
+    roster mutation could interleave between update_fixture's own read and
+    commit of the status change, mutating a roster the transition is meant
+    to freeze at that exact moment.
+
+    A plain ThreadPoolExecutor race is not a reliable way to prove this: with
+    two small, fast functions and no artificial delay, real thread scheduling
+    essentially always runs one to completion before the other starts, so a
+    race that only manifests under a narrow interleaving window will not
+    reproduce on demand (verified: it did not reproduce in 10/10 runs against
+    the pre-fix code, on top of never having a regression test at all).
+
+    Instead, this deterministically proves *mutual exclusion* itself: hold
+    the Team row's write lock open on one connection (via the same
+    begin_serialized_write/lock_row primitives update_fixture and
+    remove_team_member both use internally), start remove_team_member on a
+    second connection in a background thread, and assert it is still
+    blocked — not merely slow — after a delay that comfortably exceeds how
+    long the whole function normally takes end to end. Only releasing the
+    held lock lets it proceed."""
+    headers = login(client)
+    event = new_event(client, headers)
+    team_a = client.post(f"/api/admin/events/{event['id']}/teams", json={"name": "Team Alpha"}, headers=headers).json()
+    team_b = client.post(f"/api/admin/events/{event['id']}/teams", json={"name": "Team Bravo"}, headers=headers).json()
+    confirmed, _ = confirm_registration(client, event["public_id"], "9111111199", "Racing Player")
+    assigned = client.post(f"/api/admin/teams/{team_a['id']}/members", json={"registration_id": confirmed["id"]}, headers=headers)
+    member_id = assigned.json()["members"][0]["id"]
+    client.post(
+        f"/api/admin/events/{event['id']}/fixtures",
+        json={"team_a_id": team_a["id"], "team_b_id": team_b["id"], "scheduled_at": "2026-10-02T08:00:00"},
+        headers=headers,
+    )
+
+    from backend.app.models import Organizer, Team, TeamMember
+    from backend.app.services import begin_serialized_write, lock_row, remove_team_member
+
+    holder_session = client.app.state.session_factory()
+    begin_serialized_write(holder_session)
+    lock_row(holder_session, Team, team_a["id"])
+    try:
+        done = threading.Event()
+
+        def remove_member():
+            with client.app.state.session_factory() as session:
+                member = session.get(TeamMember, member_id)
+                organizer = session.query(Organizer).one()
+                remove_team_member(session, member, organizer)
+            done.set()
+
+        worker = threading.Thread(target=remove_member, daemon=True)
+        worker.start()
+        # Comfortably longer than the whole function takes uncontended
+        # (well under 100ms in this suite) — if it's still not done, it's
+        # genuinely blocked on the lock, not just slow.
+        still_blocked = not done.wait(timeout=1.0)
+        assert still_blocked, (
+            "remove_team_member completed while the Team row's write lock was "
+            "still held elsewhere — it is not actually contending for that lock"
+        )
+    finally:
+        holder_session.rollback()
+        holder_session.close()
+
+    worker.join(timeout=5.0)
+    assert not worker.is_alive(), "remove_team_member never proceeded after the lock was released"
+
+    roster = client.get(f"/api/admin/events/{event['id']}/teams", headers=headers).json()
+    team_alpha_roster = next(t for t in roster if t["id"] == team_a["id"])
+    assert team_alpha_roster["members"] == []
 
 
 def test_player_cannot_call_organizer_team_endpoints(client: TestClient):

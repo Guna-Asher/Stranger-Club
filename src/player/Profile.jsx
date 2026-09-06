@@ -47,6 +47,7 @@ export default function Profile() {
   const [form, setForm] = useState();
   const [formError, setFormError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [avatarBusy, setAvatarBusy] = useState(false);
   const [toast, setToast] = useState('');
 
   const checkAuth = async () => {
@@ -88,8 +89,9 @@ export default function Profile() {
   };
 
   const generateAvatar = async () => {
+    setAvatarBusy(true);
     try { setProfile(await api('/player/avatar/generate', { method: 'POST', authScope: 'player' })); setToast('New avatar generated'); }
-    catch (err) { setToast(err.message); }
+    catch (err) { setToast(err.message); } finally { setAvatarBusy(false); }
   };
 
   // Seeds the per-event "which registration is mine" key PlayerApp reads on
@@ -113,7 +115,9 @@ export default function Profile() {
     </div>
     {profile.avatar_design_id == null ? (
       <div className="form-actions">
-        <button className="primary-button" onClick={generateAvatar}><Shuffle size={16} /> GENERATE NEW</button>
+        <button className="primary-button" disabled={avatarBusy} onClick={generateAvatar}>
+          {avatarBusy ? <LoaderCircle className="spin" /> : <><Shuffle size={16} /> GENERATE NEW</>}
+        </button>
         <button className="ghost-button" onClick={() => setAvatarSheetOpen(true)}>CHOOSE AVATAR</button>
       </div>
     ) : (

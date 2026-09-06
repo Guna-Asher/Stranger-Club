@@ -1041,8 +1041,10 @@ curl http://localhost:8000/health
 curl http://localhost:8000/ready
 ```
 
-Docker's own `HEALTHCHECK` (`curl -f http://localhost:8000/health` every
-30s) is visible via:
+Docker's own `HEALTHCHECK` (`curl -f http://localhost:8000/ready` every
+30s — deliberately `/ready`, not `/health`, so a container with a working
+process but an unreachable/un-migrated database is reported unhealthy, not
+healthy) is visible via:
 
 ```bash
 docker inspect --format '{{json .State.Health.Status}}' stranger-club-app
@@ -1466,7 +1468,7 @@ except through your chosen proxy, and that a forged `X-Forwarded-For` sent
 | `migrate` service exits non-zero | A real migration error (bad `DATABASE_URL`, a broken migration) — `app` will never start, by design, since it depends on `migrate` completing successfully | `docker compose logs migrate` | Fix the underlying issue; `docker compose up --build` re-runs `migrate` (it's idempotent — already-applied migrations are a no-op) |
 | `minio-init` service exits non-zero | MinIO unreachable, or bad `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` — `mc alias set` or `mc mb` failed | `docker compose logs minio-init` | Confirm `minio` is healthy first; fix credentials if you overrode them in `.env`; re-run `docker compose up --build` |
 | `app` never becomes healthy | Usually one of the above still resolving, or a genuine startup error in the app itself | `docker compose ps`; `docker compose logs app` | Check `postgres`/`migrate`/`minio-init` are all healthy/exited-0 first, then read the app's own log for the real error |
-| `curl http://localhost:8000/ready` returns `503` even though `docker compose ps` shows `app` as healthy | `/health` (what Docker's `HEALTHCHECK` polls) only proves the process is alive — `/ready` separately checks DB connectivity and the Alembic head; a `503` here after `migrate` already completed suggests the app started before migrate's result was visible, or an unrelated DB connectivity issue | `docker compose logs app`; `docker compose logs migrate` | Should not happen given `migrate: condition: service_completed_successfully` — if it does, `docker compose restart app` and check logs for the actual `readiness_failed reason=...` |
+| `curl http://localhost:8000/ready` returns `503` | Docker's own `HEALTHCHECK` polls `/ready` (not `/health`), so `docker compose ps` should already show `app` as unhealthy in this case too — if it instead shows healthy, the container's own healthcheck hasn't re-run recently (30s interval; check `docker inspect`'s `Health.Log`). `/health` only proves the process is alive; `/ready` separately checks DB connectivity and the Alembic head — a `503` here after `migrate` already completed suggests the app started before migrate's result was visible, or an unrelated DB connectivity issue | `docker compose logs app`; `docker compose logs migrate`; `docker inspect --format='{{json .State.Health}}' <container>` | Should not happen given `migrate: condition: service_completed_successfully` — if it does, `docker compose restart app` and check logs for the actual `readiness_failed reason=...` |
 | Code changes don't seem to take effect | Compose reused a stale built image | — | `docker compose up --build` (the `--build` flag is what forces a rebuild — a bare `docker compose up` reuses whatever image already exists) |
 | Old/stale containers or volumes causing confusing behavior | Leftover state from a previous run | `docker compose ps -a`; `docker volume ls \| grep stranger_club` | `docker compose down` (keeps volumes/data) or `docker compose down -v` (destroys `stranger_club_postgres_data`/`stranger_club_minio_data` — full reset, local dev data only, see [§24](#24-clean-reset--local-restart)) |
 | Want to completely start over | Any of the above, or just want a clean slate | — | `docker compose down -v` then `docker compose up --build` — see [§24](#24-clean-reset--local-restart) |

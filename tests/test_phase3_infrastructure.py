@@ -65,6 +65,23 @@ def test_production_requires_trusted_proxy_ips(monkeypatch):
         load_config()
 
 
+def test_staging_requires_trusted_proxy_ips(monkeypatch):
+    """Staging is deployed the same way production is (real PostgreSQL, real
+    S3 — see the two checks above) and is just as likely to sit behind a real
+    reverse proxy, so it must get the same X-Forwarded-For-spoofing
+    protection production does, not just a production-only check."""
+    monkeypatch.setenv("SC_ENV", "staging")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@h/db")
+    monkeypatch.setenv("SC_STORAGE_BACKEND", "s3")
+    monkeypatch.setenv("SC_STORAGE_BUCKET", "b")
+    monkeypatch.setenv("SC_STORAGE_ENDPOINT_URL", "https://example.test")
+    monkeypatch.setenv("SC_STORAGE_ACCESS_KEY_ID", "x")
+    monkeypatch.setenv("SC_STORAGE_SECRET_ACCESS_KEY", "y")
+    monkeypatch.delenv("SC_TRUSTED_PROXY_IPS", raising=False)
+    with pytest.raises(ConfigError, match="SC_TRUSTED_PROXY_IPS"):
+        load_config()
+
+
 def test_invalid_sc_env_value_rejected(monkeypatch):
     monkeypatch.setenv("SC_ENV", "not-a-real-environment")
     with pytest.raises(ConfigError, match="SC_ENV"):

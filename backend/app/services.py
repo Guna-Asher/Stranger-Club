@@ -415,8 +415,19 @@ def update_match(session: Session, match: Match, payload: EventUpdate, organizer
 
 
 def _refresh_full_status(session: Session, match: Match) -> None:
+    """The one automatic, system-driven Event status transition — everywhere
+    else, Match.status only ever changes via update_match's explicit,
+    organizer-attributed VALID_EVENT_TRANSITIONS path (see its own audit()
+    call). This one is audited too, just with no human actor behind it."""
     if match.status in {"OPEN", "FULL"}:
-        match.status = "FULL" if match_counts(session, match.id)["confirmed"] >= match.capacity else "OPEN"
+        new_status = "FULL" if match_counts(session, match.id)["confirmed"] >= match.capacity else "OPEN"
+        if new_status != match.status:
+            before_status = match.status
+            match.status = new_status
+            audit(
+                session, "EVENT_CAPACITY_STATUS_CHANGED", "event", match.id, {"capacity": match.capacity},
+                actor_type="SYSTEM", actor_id=None, before={"status": before_status}, after={"status": new_status},
+            )
 
 
 def assert_registration_owner(registration: Registration, user_id: int) -> None:
@@ -1025,6 +1036,14 @@ def move_team_member(session: Session, member: TeamMember, new_team: Team, organ
 
 
 def remove_team_member(session: Session, member: TeamMember, organizer: Organizer) -> None:
+    # Locked on the Team row for the same reason assign_team_member/
+    # move_team_member are: without it, this function's roster-lock check has
+    # nothing serializing it against a concurrent update_fixture transition
+    # into IN_PROGRESS/COMPLETED (which locks these same Team rows — see
+    # update_fixture) or against a concurrent assign/move on the same team.
+    begin_serialized_write(session)
+    lock_row(session, Team, member.team_id)
+    member = session.get(TeamMember, member.id, populate_existing=True)
     _assert_roster_unlocked(session, member.team_id)
     _delete_team_membership(session, member, event_type="TEAM_MEMBER_REMOVED", actor_type="ORGANIZER", actor_id=organizer.id)
     session.commit()
@@ -1072,6 +1091,20 @@ def update_fixture(session: Session, fixture: Fixture, payload: FixtureUpdate, o
     changed_fields = sorted(changes)
     requested_status = changes.pop("status", None)
     before = {"status": fixture.status}
+    if requested_status in FIXTURE_ROSTER_LOCKING_STATUSES and requested_status != fixture.status:
+        # Serializes this transition against assign_team_member /
+        # move_team_member / remove_team_member, which lock these same Team
+        # rows before calling _assert_roster_unlocked. Without this, a roster
+        # mutation could interleave between this function reading
+        # fixture.status and committing the transition, changing a roster
+        # this transition is meant to freeze at the exact moment it freezes.
+        # Sorted order matches move_team_member's own two-row lock ordering,
+        # for the same deadlock-avoidance reason.
+        first_id, second_id = sorted((fixture.team_a_id, fixture.team_b_id))
+        begin_serialized_write(session)
+        lock_row(session, Team, first_id)
+        lock_row(session, Team, second_id)
+        fixture = session.get(Fixture, fixture.id, populate_existing=True)
     if changes and fixture.status != "SCHEDULED":
         raise api_error(409, "FIXTURE_ALREADY_STARTED", "This match can no longer be edited")
     if "team_a_id" in changes or "team_b_id" in changes:
@@ -1577,10 +1610,18 @@ def set_match_participants(session: Session, fixture: Fixture, entries: list[Mat
     lock is actually needed: unlike create_match_result's simple unique-
     constraint race, two concurrent full-set replacements racing here could
     otherwise interleave their deletes/inserts inconsistently."""
-    _assert_fixture_completed(fixture)
     begin_serialized_write(session)
     lock_row(session, Fixture, fixture.id)
+    # populate_existing=True, then re-check completion on the fresh object —
+    # same reasoning as create_match_result: `fixture` was loaded by the
+    # router before this lock, so checking on it directly would risk acting
+    # on a stale status. COMPLETED is currently terminal (nothing transitions
+    # out of it), so this re-check can't yet fire differently than checking
+    # before the lock would — but it keeps this function consistent with its
+    # sibling lock-then-validate functions instead of silently relying on
+    # that terminal-status assumption never changing.
     fixture = session.get(Fixture, fixture.id, populate_existing=True)
+    _assert_fixture_completed(fixture)
     valid_team_ids = (fixture.team_a_id, fixture.team_b_id)
     seen_registration_ids: set[int] = set()
     for entry in entries:

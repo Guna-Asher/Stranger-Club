@@ -325,7 +325,8 @@ docker build -t stranger-club .
 ```
 
 A multi-stage build (Node build stage → Python 3.12-slim runtime, non-root
-user, `HEALTHCHECK` against `/health`) — the **same image**, unmodified,
+user, `HEALTHCHECK` against `/ready` — not `/health`, so an unreachable or
+un-migrated database is reported unhealthy) — the **same image**, unmodified,
 that Compose builds locally is what gets deployed to a platform such as
 Render as a Docker Web Service, pointed at real managed PostgreSQL and
 real S3-compatible storage instead of the local containers. Full sequence,

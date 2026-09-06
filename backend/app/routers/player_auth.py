@@ -11,8 +11,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from ..deps import (
-    OTP_REQUEST_IP_LIMIT, OTP_REQUEST_IP_WINDOW_SECONDS, OTP_REQUEST_PHONE_LIMIT,
-    OTP_REQUEST_PHONE_WINDOW_SECONDS, OTP_VERIFY_IP_LIMIT, OTP_VERIFY_IP_WINDOW_SECONDS,
+    AVATAR_CHANGE_LIMIT, AVATAR_CHANGE_WINDOW_SECONDS, OTP_REQUEST_IP_LIMIT, OTP_REQUEST_IP_WINDOW_SECONDS,
+    OTP_REQUEST_PHONE_LIMIT, OTP_REQUEST_PHONE_WINDOW_SECONDS, OTP_VERIFY_IP_LIMIT, OTP_VERIFY_IP_WINDOW_SECONDS,
     PLAYER_SESSION_COOKIE, PLAYER_SESSION_DAYS, get_session,
     player_auth_context, require_player, require_player_csrf, token_hash,
 )
@@ -111,11 +111,13 @@ def get_avatar_options(player: User = Depends(require_player), session: Session 
 
 @router.post("/api/player/avatar/generate", response_model=PlayerProfileResponse)
 def generate_avatar(player: User = Depends(require_player_csrf), session: Session = Depends(get_session)):
+    enforce_rate_limit_db(session, f"avatar_change:{player.id}", AVATAR_CHANGE_LIMIT, AVATAR_CHANGE_WINDOW_SECONDS)
     profile = session.scalar(select(PlayerProfile).where(PlayerProfile.user_id == player.id))
     return assign_new_avatar(session, profile)
 
 
 @router.put("/api/player/avatar", response_model=PlayerProfileResponse)
 def put_avatar(payload: AvatarChoose, player: User = Depends(require_player_csrf), session: Session = Depends(get_session)):
+    enforce_rate_limit_db(session, f"avatar_change:{player.id}", AVATAR_CHANGE_LIMIT, AVATAR_CHANGE_WINDOW_SECONDS)
     profile = session.scalar(select(PlayerProfile).where(PlayerProfile.user_id == player.id))
     return choose_avatar(session, profile, payload.design_id)

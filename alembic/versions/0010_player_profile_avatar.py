@@ -75,6 +75,18 @@ def upgrade() -> None:
         row[0] for row in bind.execute(sa.text("SELECT id FROM player_profiles WHERE avatar_design_id IS NULL ORDER BY id"))
     ]
     taken = set(bind.execute(sa.text("SELECT avatar_design_id FROM player_profiles WHERE avatar_design_id IS NOT NULL")).scalars())
+    # Precondition checked before any UPDATE runs (same "validate first, then
+    # mutate" shape as 0002's capacity/fee check) — SQLite's DDL above is
+    # non-transactional, so failing loudly here, before touching a single
+    # data row, is what keeps a too-small catalog from ever leaving a
+    # partially-backfilled table; failing partway through the loop below
+    # instead would.
+    if len(existing_profile_ids) + len(taken) > AVATAR_CATALOG_SIZE:
+        raise RuntimeError(
+            f"Cannot backfill avatar_design_id: {len(existing_profile_ids)} profile(s) need one and "
+            f"{len(taken)} design(s) are already taken, exceeding the {AVATAR_CATALOG_SIZE}-design catalog. "
+            "Raise AVATAR_CATALOG_SIZE (and this migration's own frozen copy of it) before retrying."
+        )
     available = (design_id for design_id in range(AVATAR_CATALOG_SIZE) if design_id not in taken)
     for profile_id in existing_profile_ids:
         bind.execute(

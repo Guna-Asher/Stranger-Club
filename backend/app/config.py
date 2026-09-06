@@ -89,10 +89,11 @@ def load_config() -> AppConfig:
 
     trusted_proxy_raw = _env("SC_TRUSTED_PROXY_IPS", "")
     trusted_proxy_ips = tuple(ip.strip() for ip in trusted_proxy_raw.split(",") if ip.strip())
-    if env == "production" and not trusted_proxy_ips:
+    if env in {"staging", "production"} and not trusted_proxy_ips:
         raise ConfigError(
-            "SC_ENV=production requires SC_TRUSTED_PROXY_IPS to be set to the reverse proxy's IP(s)/CIDR(s) — "
-            "without it, X-Forwarded-For could be spoofed by any client to bypass IP-based rate limiting."
+            f"SC_ENV={env} requires SC_TRUSTED_PROXY_IPS to be set to the reverse proxy's IP(s)/CIDR(s) — "
+            "without it, X-Forwarded-For could be spoofed by any client to bypass IP-based rate limiting, and "
+            "every request behind that proxy would otherwise share one IP-keyed rate-limit bucket with each other."
         )
 
     def _int_env(name: str, default: int) -> int:
