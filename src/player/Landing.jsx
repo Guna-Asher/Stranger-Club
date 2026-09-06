@@ -16,20 +16,20 @@ export default function Landing() {
   }, []);
 
   return <>
-    <section className="match-hero">
+    <section className="match-hero landing-hero">
       <div className="grid" />
       <header className="public-header">
         <Brand light />
         <Link to="/profile">MY PROFILE <ArrowUpRight size={14} /></Link>
       </header>
       <div className="hero-copy landing-copy">
-        <p className="eyebrow lime">PICK-UP CRICKET, EVERY WEEK</p>
-        <h1>STRANGER CRICKET.<br />REAL PEOPLE.<br />ONE MATCH AT A TIME.</h1>
+        <p className="eyebrow lime">STRANGER CLUB</p>
+        <h1>Real strangers.<br />Real cricket.</h1>
         <a className="primary-button" href="#events">FIND A MATCH <ArrowRight size={17} /></a>
       </div>
     </section>
     <section className="match-body" id="events">
-      <div className="section-title"><div><p className="eyebrow">OPEN NOW</p><h2>UPCOMING MATCHES</h2></div></div>
+      <div className="section-title"><div><p className="eyebrow">OPEN NOW</p><h2>UPCOMING EVENTS</h2></div></div>
       {error && <p className="form-error">{error}</p>}
       {events && events.length === 0 && (
         <div className="empty"><Users /><h2>NO OPEN MATCHES</h2><p>Check back soon — new matches are added every week.</p></div>

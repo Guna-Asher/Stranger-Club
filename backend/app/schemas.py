@@ -190,6 +190,20 @@ class PlayerProfileResponse(BaseModel):
     cricket_role: str = "NO_PREFERENCE"
     skill_rating: int | None = None
     bio: str | None = None
+    avatar_design_id: int | None = None
+
+
+class AvatarChoose(BaseModel):
+    design_id: int = Field(ge=0)
+
+
+class AvatarCatalogStatus(BaseModel):
+    catalog_size: int
+    current: int | None = None
+    # Every currently-claimed design ID other than the caller's own — the
+    # frontend renders the full 0..catalog_size-1 grid itself and just needs
+    # to know which of those are unavailable.
+    taken: list[int] = []
 
 
 class RejectRequest(BaseModel):
@@ -285,6 +299,9 @@ class RegistrationResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     payment: PaymentResponse | None = None
+    # The registration owner's current player avatar, if they have one — NULL
+    # for legacy/unauthenticated registrations with no linked User/PlayerProfile.
+    avatar_design_id: int | None = None
 
 
 class AdminMatchDetail(MatchResponse):
@@ -356,6 +373,7 @@ class TeamMemberResponse(BaseModel):
     preferred_position: str = "NO_PREFERENCE"
     assigned_position: str | None = None
     created_at: datetime
+    avatar_design_id: int | None = None
 
 
 class TeamRosterResponse(TeamResponse):
@@ -431,6 +449,7 @@ class PlayerTeammate(BaseModel):
     name: str
     preferred_position: str = "NO_PREFERENCE"
     assigned_position: str | None = None
+    avatar_design_id: int | None = None
 
 
 class PlayerTeamResponse(BaseModel):
@@ -438,12 +457,20 @@ class PlayerTeamResponse(BaseModel):
     teammates: list[PlayerTeammate] = []
 
 
+class PlayerAwardSummary(BaseModel):
+    """A player-facing mention of an award recipient (MVP/Best Batter/Best
+    Bowler) — just enough to render a name and avatar, deliberately without
+    the admin-facing registration_id (see MatchAwardSummary)."""
+    name: str
+    avatar_design_id: int | None = None
+
+
 class PlayerMatchResultSummary(BaseModel):
     result_type: str
     winning_team: TeamSummary | None = None
-    player_of_match_name: str | None = None
-    best_batter_name: str | None = None
-    best_bowler_name: str | None = None
+    player_of_match: PlayerAwardSummary | None = None
+    best_batter: PlayerAwardSummary | None = None
+    best_bowler: PlayerAwardSummary | None = None
     participated: bool = False
 
 
@@ -474,11 +501,13 @@ class MatchParticipantResponse(BaseModel):
     team_id: int
     player_name: str
     participation_status: str = "PLAYED"
+    avatar_design_id: int | None = None
 
 
 class MatchAwardSummary(BaseModel):
     registration_id: int
     name: str
+    avatar_design_id: int | None = None
 
 
 class MatchResultCreate(BaseModel):
@@ -562,9 +591,9 @@ class PlayerDashboardFixture(BaseModel):
 class PlayerDashboardCompletedFixture(PlayerDashboardFixture):
     result_type: str
     winning_team: TeamSummary | None = None
-    player_of_match_name: str | None = None
-    best_batter_name: str | None = None
-    best_bowler_name: str | None = None
+    player_of_match: PlayerAwardSummary | None = None
+    best_batter: PlayerAwardSummary | None = None
+    best_bowler: PlayerAwardSummary | None = None
     participated: bool = False
 
 

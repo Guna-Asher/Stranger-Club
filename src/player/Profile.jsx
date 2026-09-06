@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
-import { ArrowLeft, ChevronRight, LoaderCircle, Pencil } from 'lucide-react';
+import { ArrowLeft, ChevronRight, LoaderCircle, Pencil, RefreshCw, Shuffle } from 'lucide-react';
 import { Link, useNavigate } from 'react-router-dom';
+import Avatar from '../components/Avatar';
 import Brand from '../components/Brand';
 import Field from '../components/Field';
 import FormError from '../components/FormError';
@@ -8,6 +9,7 @@ import Loading from '../components/Loading';
 import ErrorPage from '../components/ErrorPage';
 import Status from '../components/Status';
 import Toast from '../components/Toast';
+import AvatarPicker from './AvatarPicker';
 import PhoneVerify from './PhoneVerify';
 import { api, setCsrfToken } from '../lib/api';
 import { dateText, timeText } from '../lib/format';
@@ -17,10 +19,21 @@ const ROLE_LABEL = {
   ALL_ROUNDER: 'All-rounder', WICKET_KEEPER: 'Wicket keeper',
 };
 
+// An event whose own status has reached one of these is done — its
+// registration no longer belongs alongside still-current events (see
+// services.player_dashboard: event.status is the only thing that decides
+// this, never date, never whether one of its matches happened to finish).
+const EVENT_CONCLUDED_STATUSES = new Set(['COMPLETED', 'CANCELLED']);
+
 // Merges registration + payment status the same way lib/format.playerStatus
 // does, for the shape the dashboard endpoint returns (payment_status is a
 // flat field here, not a nested payment object).
 const registrationStatus = (r) => (r.status !== 'CANCELLED' && r.payment_status === 'SUBMITTED' ? 'PAYMENT_SUBMITTED' : r.status);
+
+function AwardRow({ label, award }) {
+  if (!award) return null;
+  return <div className="award-row"><small>{label}</small><Avatar designId={award.avatar_design_id} name={award.name} size={22} /><b>{award.name}</b></div>;
+}
 
 export default function Profile() {
   const navigate = useNavigate();
@@ -30,6 +43,7 @@ export default function Profile() {
   const [dashboard, setDashboard] = useState();
   const [error, setError] = useState('');
   const [editing, setEditing] = useState(false);
+  const [avatarSheetOpen, setAvatarSheetOpen] = useState(false);
   const [form, setForm] = useState();
   const [formError, setFormError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -73,22 +87,40 @@ export default function Profile() {
     setFormError(''); setEditing(false);
   };
 
+  const generateAvatar = async () => {
+    try { setProfile(await api('/player/avatar/generate', { method: 'POST', authScope: 'player' })); setToast('New avatar generated'); }
+    catch (err) { setToast(err.message); }
+  };
+
   // Seeds the per-event "which registration is mine" key PlayerApp reads on
   // load, so continuing into an event from here lands on the player's own
   // status ticket instead of the generic join screen.
   const openEvent = (registration) => { try { localStorage.setItem(`sc-registration-${registration.event.public_id}`, registration.public_id); } catch { /* best-effort */ } };
+
+  // A concluded event's registration is already represented (if it matters)
+  // under RECENT RESULTS below — keeping it here too would show the same
+  // event as both current and past at once.
+  const currentRegistrations = dashboard.registrations.filter((r) => !EVENT_CONCLUDED_STATUSES.has(r.event.status));
 
   return <section className="flow profile-page">
     <Toast text={toast} clear={() => setToast('')} />
     <header className="flow-header"><button onClick={() => navigate('/')}><ArrowLeft /></button><span>MY PROFILE</span><Brand /></header>
     <div className="intro"><p className="eyebrow">STRANGER CLUB PLAYER</p><h1>{profile.display_name || 'YOUR PROFILE'}</h1></div>
 
-    {!editing ? (
-      <div className="ticket">
-        <div><b>{profile.display_name || 'No name set yet'}</b><span>{ROLE_LABEL[profile.cricket_role] || profile.cricket_role}</span></div>
-        {profile.bio && <p className="quiet">{profile.bio}</p>}
+    <div className="profile-identity">
+      <Avatar designId={profile.avatar_design_id} name={profile.display_name} size={64} />
+      <div><b>{profile.display_name || 'No name set yet'}</b><span>{ROLE_LABEL[profile.cricket_role] || profile.cricket_role}</span></div>
+    </div>
+    {profile.avatar_design_id == null ? (
+      <div className="form-actions">
+        <button className="primary-button" onClick={generateAvatar}><Shuffle size={16} /> GENERATE NEW</button>
+        <button className="ghost-button" onClick={() => setAvatarSheetOpen(true)}>CHOOSE AVATAR</button>
       </div>
     ) : (
+      <button className="ghost-button" onClick={() => setAvatarSheetOpen(true)}><RefreshCw size={15} /> CHANGE AVATAR</button>
+    )}
+
+    {editing && (
       <form className="form" onSubmit={save}>
         <Field label="DISPLAY NAME" placeholder="Your name" value={form.display_name} set={(v) => setForm({ ...form, display_name: v })} />
         <label className="field"><span>CRICKET ROLE</span>
@@ -105,6 +137,7 @@ export default function Profile() {
       </form>
     )}
     {!editing && <button className="ghost-button" onClick={() => setEditing(true)}><Pencil size={15} /> EDIT PROFILE</button>}
+    {profile.bio && !editing && <p className="quiet">{profile.bio}</p>}
 
     {dashboard.upcoming.length > 0 && <>
       <div className="section-title"><div><p className="eyebrow">NEXT UP</p><h2>UPCOMING</h2></div></div>
@@ -116,9 +149,9 @@ export default function Profile() {
       ))}
     </>}
 
-    {dashboard.registrations.length > 0 && <>
+    {currentRegistrations.length > 0 && <>
       <div className="section-title"><div><p className="eyebrow">MY EVENTS</p><h2>REGISTRATIONS</h2></div></div>
-      {dashboard.registrations.map((r) => (
+      {currentRegistrations.map((r) => (
         <Link className="match-row" to={`/events/${r.event.public_id}`} onClick={() => openEvent(r)} key={r.public_id}>
           <span><small>{dateText(r.event.date)}</small><b>{r.event.name}</b><i>{r.event.venue}{r.team ? ` · ${r.team.name.toUpperCase()}` : ''}</i></span>
           <Status status={registrationStatus(r)} />
@@ -135,16 +168,20 @@ export default function Profile() {
             <b>{f.result_type === 'DRAW' ? 'MATCH DRAWN' : f.result_type === 'NO_RESULT' ? 'NO RESULT' : `${f.winning_team?.name.toUpperCase()} WON`}</b>
             <span>{f.opponent ? `VS ${f.opponent.name} · ` : ''}{dateText(f.scheduled_at.slice(0, 10))}</span>
           </div>
-          {(f.player_of_match_name || f.best_batter_name || f.best_bowler_name) && (
-            <p className="quiet">
-              {f.player_of_match_name && `Player of the Match: ${f.player_of_match_name}. `}
-              {f.best_batter_name && `Best Batter: ${f.best_batter_name}. `}
-              {f.best_bowler_name && `Best Bowler: ${f.best_bowler_name}.`}
-            </p>
-          )}
+          <AwardRow label="PLAYER OF THE MATCH" award={f.player_of_match} />
+          <AwardRow label="BEST BATTER" award={f.best_batter} />
+          <AwardRow label="BEST BOWLER" award={f.best_bowler} />
           <footer><small>YOU PLAYED</small><strong>{f.participated ? 'YES' : 'NO'}</strong></footer>
         </div>
       ))}
     </>}
+
+    {avatarSheetOpen && (
+      <AvatarPicker
+        close={() => setAvatarSheetOpen(false)}
+        onChanged={(p) => { setProfile(p); setToast('Avatar updated'); }}
+        toast={setToast}
+      />
+    )}
   </section>;
 }

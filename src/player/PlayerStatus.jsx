@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { ArrowLeft, CalendarPlus, ChevronRight, Share2 } from 'lucide-react';
+import Avatar from '../components/Avatar';
 import Status from '../components/Status';
 import CancelConfirm from './CancelConfirm';
 import { api } from '../lib/api';
@@ -7,6 +8,11 @@ import { dateText, playerStatus, timeText } from '../lib/format';
 
 const CANCELLABLE_REGISTRATION_STATUSES = new Set(['PENDING', 'WAITLISTED', 'CONFIRMED']);
 const CANCELLABLE_EVENT_STATUSES = new Set(['DRAFT', 'OPEN', 'FULL']);
+
+function AwardLine({ label, award }) {
+  if (!award) return null;
+  return <div className="award-row"><small>{label}</small><Avatar designId={award.avatar_design_id} name={award.name} size={22} /><b>{award.name}</b></div>;
+}
 
 export default function PlayerStatus({ match, registration, teamInfo, fixtures, back, retry, refresh, rejoin, onCancelled, toast }) {
   const [confirming, setConfirming] = useState(false);
@@ -22,7 +28,11 @@ export default function PlayerStatus({ match, registration, teamInfo, fixtures, 
   const opponent = upcomingFixture && (upcomingFixture.team_a.id === upcomingFixture.my_team_id ? upcomingFixture.team_b : upcomingFixture.team_a);
   const completedFixtures = confirmed ? (fixtures || []).filter((f) => f.my_team_id && f.status === 'COMPLETED' && f.result) : [];
   return <section className="status-page"><button className="back" onClick={back}><ArrowLeft /> MATCH DETAILS</button><p className="eyebrow status-page-eyebrow">{dateText(match.date)}</p><h1>{content[0]}</h1><p>{content[1]}</p><div className="ticket"><div><b>{match.name}</b><span>{timeText(match.start_time)} · {match.venue}</span></div><Status status={playerStatus(registration)} /><footer><small>PAYMENT</small><strong>{confirmed ? `₹${registration.payment?.amount_due}` : submitted ? 'VERIFYING' : waitlisted ? 'WAITLISTED' : cancelled ? '—' : 'REUPLOAD'}</strong></footer></div>
-    {myTeam && <div className="ticket"><div><b>YOUR TEAM: {myTeam.name.toUpperCase()}</b><span>{teamInfo.teammates.length === 0 ? 'No teammates assigned yet' : teamInfo.teammates.map((t) => t.name).join(', ')}</span></div></div>}
+    {myTeam && <div className="ticket"><div><b>YOUR TEAM: {myTeam.name.toUpperCase()}</b>
+      {teamInfo.teammates.length === 0
+        ? <span>No teammates assigned yet</span>
+        : teamInfo.teammates.map((t, i) => <div className="teammate-row" key={`${t.name}-${i}`}><Avatar designId={t.avatar_design_id} name={t.name} size={26} /><b>{t.name}</b></div>)}
+    </div></div>}
     {upcomingFixture && <div className="ticket"><div><b>VS {opponent.name.toUpperCase()}</b><span>{dateText(upcomingFixture.scheduled_at.slice(0, 10))} · {timeText(upcomingFixture.scheduled_at.slice(11, 16))} · {upcomingFixture.venue_override || match.venue}</span></div><Status status={upcomingFixture.status} /></div>}
     {completedFixtures.map((f) => (
       <div className="ticket" key={f.id}>
@@ -30,13 +40,9 @@ export default function PlayerStatus({ match, registration, teamInfo, fixtures, 
           <b>{f.result.result_type === 'DRAW' ? 'MATCH DRAWN' : f.result.result_type === 'NO_RESULT' ? 'NO RESULT' : f.result.winning_team?.id === f.my_team_id ? 'YOUR TEAM WON' : `${f.result.winning_team?.name.toUpperCase()} WON`}</b>
           <span>{f.team_a.name} vs {f.team_b.name} · {dateText(f.scheduled_at.slice(0, 10))}</span>
         </div>
-        {(f.result.player_of_match_name || f.result.best_batter_name || f.result.best_bowler_name) && (
-          <p className="quiet">
-            {f.result.player_of_match_name && `Player of the Match: ${f.result.player_of_match_name}. `}
-            {f.result.best_batter_name && `Best Batter: ${f.result.best_batter_name}. `}
-            {f.result.best_bowler_name && `Best Bowler: ${f.result.best_bowler_name}.`}
-          </p>
-        )}
+        <AwardLine label="PLAYER OF THE MATCH" award={f.result.player_of_match} />
+        <AwardLine label="BEST BATTER" award={f.result.best_batter} />
+        <AwardLine label="BEST BOWLER" award={f.result.best_bowler} />
         <footer><small>YOU PLAYED</small><strong>{f.result.participated ? 'YES' : 'NO'}</strong></footer>
       </div>
     ))}

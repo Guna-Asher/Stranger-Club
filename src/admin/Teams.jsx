@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ArrowUpRight, Plus, X } from 'lucide-react';
+import Avatar from '../components/Avatar';
 import { api } from '../lib/api';
 
 export default function Teams({ match, toast }) {
@@ -58,7 +59,7 @@ export default function Teams({ match, toast }) {
           <div>
             {team.members.map((member) => (
               <div className="player-row" key={member.id}>
-                <span className="avatar">{member.player_name[0]}</span>
+                <Avatar designId={member.avatar_design_id} name={member.player_name} />
                 <span><b>{member.player_name}</b><small>{(member.assigned_position || member.preferred_position || 'NO_PREFERENCE').replaceAll('_', ' ')}</small></span>
                 <button onClick={() => removeMember(member)}><X size={15} /></button>
               </div>
@@ -88,7 +89,7 @@ export default function Teams({ match, toast }) {
               {eligible.length === 0 && <p className="quiet">Every confirmed player already has a team.</p>}
               {eligible.map((r) => (
                 <button className="player-row" key={r.id} onClick={() => assign(r.id)}>
-                  <span className="avatar">{r.name[0]}</span>
+                  <Avatar designId={r.avatar_design_id} name={r.name} />
                   <span><b>{r.name}</b><small>{(r.preferred_position || 'NO_PREFERENCE').replaceAll('_', ' ')}</small></span>
                   <ArrowUpRight size={16} />
                 </button>

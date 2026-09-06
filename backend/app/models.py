@@ -55,6 +55,14 @@ RESULT_TYPES = ("TEAM_A_WIN", "TEAM_B_WIN", "DRAW", "NO_RESULT")
 # migration, without inventing meaning that doesn't exist yet.
 PARTICIPATION_STATUSES = ("PLAYED",)
 
+# Size of the finite, code-defined avatar design catalog (see PlayerProfile.
+# avatar_design_id). Each design is a deterministic pixel/identicon pattern
+# rendered client-side from its integer ID alone — nothing about the design
+# itself is stored server-side. Comfortably larger than this club's
+# foreseeable player count while staying small enough that "list every taken
+# ID" (see services.avatar_catalog_status) is always a single cheap query.
+AVATAR_CATALOG_SIZE = 256
+
 
 def _sql_in_tuple(values: tuple[str, ...]) -> str:
     """Python's tuple repr — used elsewhere in this file for CHECK
@@ -627,6 +635,17 @@ class PlayerProfile(Base):
     skill_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
     photo_storage_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     bio: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The player's current avatar: an index (0..AVATAR_CATALOG_SIZE-1) into a
+    # fixed, frontend-rendered pixel/identicon catalog — never derived from
+    # display_name/cricket_role/team/event, so editing any of those can never
+    # change it (see services.assign_new_avatar / choose_avatar). NULL until a
+    # player generates/chooses one. The column's own UNIQUE constraint (NULLs
+    # excluded from uniqueness on both SQLite and PostgreSQL) is the actual
+    # ownership guarantee — one design can never be the *current* avatar of
+    # two profiles at once — not merely a low-collision-probability hash.
+    # Reuse policy: releasing an avatar (by switching to another one) frees
+    # it for reassignment immediately; no history of past avatars is kept.
+    avatar_design_id: Mapped[int | None] = mapped_column(Integer, nullable=True, unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist, onupdate=now_ist)
 

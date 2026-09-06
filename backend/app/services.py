@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import random
 import re
 import uuid
 from datetime import date, datetime, time
@@ -15,9 +16,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from .models import (
-    ACTIVE_REGISTRATION_STATUSES, AuditLog, EventPaymentConfiguration, Fixture, FIXTURE_ROSTER_LOCKING_STATUSES,
-    Match, MatchParticipant, MatchResult, Organizer, Payment, PaymentProof, Registration, Team, TeamMember, User,
-    now_ist,
+    ACTIVE_REGISTRATION_STATUSES, AVATAR_CATALOG_SIZE, AuditLog, EventPaymentConfiguration, Fixture,
+    FIXTURE_ROSTER_LOCKING_STATUSES, Match, MatchParticipant, MatchResult, Organizer, Payment, PaymentProof,
+    PlayerProfile, Registration, Team, TeamMember, User, now_ist,
 )
 from .schemas import (
     EventUpdate, FixtureCreate, FixtureUpdate, MatchCreate, MatchParticipantEntry, MatchResultCreate,
@@ -275,12 +276,25 @@ def payment_to_response(payment: Payment | None, *, viewer: str = "player", sess
     return data
 
 
+def _avatar_design_id(registration: Registration | None) -> int | None:
+    """The player's current avatar, reached through Registration.user ->
+    User.profile -> PlayerProfile.avatar_design_id. NULL for a registration
+    with no linked authenticated player (legacy data) or one who hasn't
+    picked an avatar yet. Callers building a *list* of these should eager-load
+    `.user` and `.user.profile` alongside `.registration` up front — this
+    function itself never issues a query, only reads what's already loaded."""
+    if registration is None or registration.user is None or registration.user.profile is None:
+        return None
+    return registration.user.profile.avatar_design_id
+
+
 def registration_to_response(registration: Registration, *, viewer: str = "player", session: Session | None = None) -> dict:
     return {"id": registration.id, "public_id": registration.public_id, "match_id": registration.match_id,
             "name": registration.name, "phone": registration.phone, "email": registration.email, "status": registration.status,
             "preferred_position": registration.preferred_position or "NO_PREFERENCE", "assigned_position": registration.assigned_position,
             "created_at": registration.created_at, "updated_at": registration.updated_at,
-            "payment": payment_to_response(registration.payment, viewer=viewer, session=session)}
+            "payment": payment_to_response(registration.payment, viewer=viewer, session=session),
+            "avatar_design_id": _avatar_design_id(registration)}
 
 
 def get_public_match(session: Session, public_id: str) -> Match:
@@ -833,12 +847,14 @@ def team_member_to_response(member: TeamMember) -> dict:
         "id": member.id, "team_id": member.team_id, "registration_id": member.registration_id,
         "player_name": registration.name, "preferred_position": registration.preferred_position or "NO_PREFERENCE",
         "assigned_position": registration.assigned_position, "created_at": member.created_at,
+        "avatar_design_id": _avatar_design_id(registration),
     }
 
 
 def team_roster_response(session: Session, team: Team) -> dict:
     members = session.scalars(
-        select(TeamMember).options(joinedload(TeamMember.registration))
+        select(TeamMember)
+        .options(joinedload(TeamMember.registration).joinedload(Registration.user).joinedload(User.profile))
         .where(TeamMember.team_id == team.id).order_by(TeamMember.created_at)
     ).all()
     data = team_to_response(session, team)
@@ -852,7 +868,9 @@ def event_teams_with_rosters(session: Session, event_id: int) -> list[dict]:
     those teams eager-loaded via selectinload, never one query per team
     (see the Phase 4 plan's indexing/N+1 requirement)."""
     teams = session.scalars(
-        select(Team).options(selectinload(Team.members).joinedload(TeamMember.registration))
+        select(Team).options(
+            selectinload(Team.members).joinedload(TeamMember.registration).joinedload(Registration.user).joinedload(User.profile)
+        )
         .where(Team.event_id == event_id).order_by(Team.created_at)
     ).all()
     result = []
@@ -1108,7 +1126,8 @@ def player_team_response(session: Session, match: Match, user: User) -> dict:
         return {"team": None, "teammates": []}
     team = session.get(Team, member.team_id)
     teammates = session.scalars(
-        select(TeamMember).options(joinedload(TeamMember.registration))
+        select(TeamMember)
+        .options(joinedload(TeamMember.registration).joinedload(Registration.user).joinedload(User.profile))
         .where(TeamMember.team_id == team.id, TeamMember.id != member.id)
     ).all()
     return {
@@ -1116,7 +1135,7 @@ def player_team_response(session: Session, match: Match, user: User) -> dict:
         "teammates": [
             {
                 "name": m.registration.name, "preferred_position": m.registration.preferred_position or "NO_PREFERENCE",
-                "assigned_position": m.registration.assigned_position,
+                "assigned_position": m.registration.assigned_position, "avatar_design_id": _avatar_design_id(m.registration),
             }
             for m in teammates
         ],
@@ -1157,7 +1176,13 @@ def player_fixtures_response(session: Session, match: Match, user: User) -> list
         if rid is not None
     }
     registrations_by_id = (
-        {r.id: r for r in session.scalars(select(Registration).where(Registration.id.in_(award_registration_ids))).all()}
+        {
+            r.id: r for r in session.scalars(
+                select(Registration)
+                .options(joinedload(Registration.user).joinedload(User.profile))
+                .where(Registration.id.in_(award_registration_ids))
+            ).all()
+        }
         if award_registration_ids else {}
     )
 
@@ -1167,16 +1192,18 @@ def player_fixtures_response(session: Session, match: Match, user: User) -> list
             return None
         winning_team = teams_by_id.get(result.winning_team_id) if result.winning_team_id else None
 
-        def award_name(registration_id: int | None) -> str | None:
+        def award(registration_id: int | None) -> dict | None:
             award_registration = registrations_by_id.get(registration_id) if registration_id else None
-            return award_registration.name if award_registration else None
+            if not award_registration:
+                return None
+            return {"name": award_registration.name, "avatar_design_id": _avatar_design_id(award_registration)}
 
         return {
             "result_type": result.result_type,
             "winning_team": {"id": winning_team.id, "name": winning_team.name, "short_code": winning_team.short_code} if winning_team else None,
-            "player_of_match_name": award_name(result.player_of_match_registration_id),
-            "best_batter_name": award_name(result.best_batter_registration_id),
-            "best_bowler_name": award_name(result.best_bowler_registration_id),
+            "player_of_match": award(result.player_of_match_registration_id),
+            "best_batter": award(result.best_batter_registration_id),
+            "best_bowler": award(result.best_bowler_registration_id),
             "participated": fixture_id in my_participation,
         }
 
@@ -1252,16 +1279,24 @@ def player_dashboard(session: Session, user: User) -> dict:
         if rid is not None
     }
     award_registrations_by_id = (
-        {r.id: r for r in session.scalars(select(Registration).where(Registration.id.in_(award_registration_ids))).all()}
+        {
+            r.id: r for r in session.scalars(
+                select(Registration)
+                .options(joinedload(Registration.user).joinedload(User.profile))
+                .where(Registration.id.in_(award_registration_ids))
+            ).all()
+        }
         if award_registration_ids else {}
     )
 
     def team_summary(team: Team | None) -> dict | None:
         return {"id": team.id, "name": team.name, "short_code": team.short_code} if team else None
 
-    def award_name(registration_id: int | None) -> str | None:
+    def award(registration_id: int | None) -> dict | None:
         award_registration = award_registrations_by_id.get(registration_id) if registration_id else None
-        return award_registration.name if award_registration else None
+        if not award_registration:
+            return None
+        return {"name": award_registration.name, "avatar_design_id": _avatar_design_id(award_registration)}
 
     upcoming: list[dict] = []
     completed: list[dict] = []
@@ -1282,9 +1317,9 @@ def player_dashboard(session: Session, user: User) -> dict:
                 **entry,
                 "result_type": result.result_type,
                 "winning_team": team_summary(winner_teams_by_id.get(result.winning_team_id)),
-                "player_of_match_name": award_name(result.player_of_match_registration_id),
-                "best_batter_name": award_name(result.best_batter_registration_id),
-                "best_bowler_name": award_name(result.best_bowler_registration_id),
+                "player_of_match": award(result.player_of_match_registration_id),
+                "best_batter": award(result.best_batter_registration_id),
+                "best_bowler": award(result.best_bowler_registration_id),
                 "participated": f.id in my_participation,
             })
     completed.sort(key=lambda entry: entry["scheduled_at"], reverse=True)
@@ -1305,6 +1340,70 @@ def player_dashboard(session: Session, user: User) -> dict:
         "upcoming": upcoming,
         "completed": completed,
     }
+
+
+# ---------------------------------------------------------------------------
+# Player avatars: a finite, code-defined pixel/identicon catalog
+# (AVATAR_CATALOG_SIZE designs, IDs 0..N-1). Nothing about a design's actual
+# appearance is stored here — the frontend renders it deterministically from
+# the ID alone (see src/components/Avatar.jsx). All this module manages is
+# *ownership*: PlayerProfile.avatar_design_id's own UNIQUE constraint is the
+# only thing that makes "one design, one current owner" true, never a
+# pre-check-then-write race. Every write below follows the same
+# flush-and-catch-IntegrityError shape as create_match_result elsewhere in
+# this file, for the same reason: a UNIQUE violation is the expected outcome
+# of a genuine two-player race, not a bug, so it becomes a clean 409, not a
+# raw 500.
+# ---------------------------------------------------------------------------
+
+def avatar_catalog_status(session: Session, profile: PlayerProfile) -> dict:
+    taken = set(session.scalars(select(PlayerProfile.avatar_design_id).where(PlayerProfile.avatar_design_id.is_not(None))))
+    taken.discard(profile.avatar_design_id)
+    return {"catalog_size": AVATAR_CATALOG_SIZE, "current": profile.avatar_design_id, "taken": sorted(taken)}
+
+
+def assign_new_avatar(session: Session, profile: PlayerProfile) -> PlayerProfile:
+    """'GENERATE NEW' — picks a currently-unclaimed design at random. Retries
+    a handful of times against a fresh view of what's taken before giving up:
+    normal operation under this club's scale (a small fraction of a
+    256-design catalog ever claimed at once), so a retry only ever fires
+    because of a genuine concurrent claim on the exact ID this call picked."""
+    for _ in range(5):
+        taken = set(session.scalars(select(PlayerProfile.avatar_design_id).where(PlayerProfile.avatar_design_id.is_not(None))))
+        available = [design_id for design_id in range(AVATAR_CATALOG_SIZE) if design_id not in taken]
+        if not available:
+            raise api_error(409, "NO_AVATARS_AVAILABLE", "Every avatar is currently taken. Please try again shortly.")
+        profile.avatar_design_id = random.choice(available)
+        try:
+            session.flush()
+        except IntegrityError:
+            session.rollback()
+            session.refresh(profile)
+            continue
+        session.commit()
+        session.refresh(profile)
+        return profile
+    raise api_error(409, "AVATAR_TAKEN", "Couldn't assign a new avatar right now. Please try again.")
+
+
+def choose_avatar(session: Session, profile: PlayerProfile, design_id: int) -> PlayerProfile:
+    """'CHOOSE AVATAR' / 'CHANGE AVATAR' — claims a specific design. The
+    UNIQUE constraint on avatar_design_id is what actually prevents two
+    players from ending up with the same current avatar; this only decides
+    what clean response a conflict becomes."""
+    if not (0 <= design_id < AVATAR_CATALOG_SIZE):
+        raise api_error(422, "VALIDATION_ERROR", f"design_id must be between 0 and {AVATAR_CATALOG_SIZE - 1}")
+    if design_id == profile.avatar_design_id:
+        return profile
+    profile.avatar_design_id = design_id
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        raise api_error(409, "AVATAR_TAKEN", "That avatar was just taken by someone else. Pick another.")
+    session.commit()
+    session.refresh(profile)
+    return profile
 
 
 # ---------------------------------------------------------------------------
@@ -1424,7 +1523,12 @@ def match_result_to_response(session: Session, result: MatchResult) -> dict:
         if rid is not None
     ]
     registrations = (
-        {r.id: r for r in session.scalars(select(Registration).where(Registration.id.in_(award_ids))).all()} if award_ids else {}
+        {
+            r.id: r for r in session.scalars(
+                select(Registration).options(joinedload(Registration.user).joinedload(User.profile))
+                .where(Registration.id.in_(award_ids))
+            ).all()
+        } if award_ids else {}
     )
 
     def team_summary(team_id: int | None) -> dict | None:
@@ -1433,7 +1537,9 @@ def match_result_to_response(session: Session, result: MatchResult) -> dict:
 
     def award_summary(registration_id: int | None) -> dict | None:
         registration = registrations.get(registration_id) if registration_id else None
-        return {"registration_id": registration_id, "name": registration.name} if registration else None
+        if not registration:
+            return None
+        return {"registration_id": registration_id, "name": registration.name, "avatar_design_id": _avatar_design_id(registration)}
 
     return {
         "id": result.id, "fixture_id": result.fixture_id, "result_type": result.result_type,
@@ -1450,12 +1556,14 @@ def match_participant_to_response(participant: MatchParticipant) -> dict:
     return {
         "id": participant.id, "registration_id": participant.registration_id, "team_id": participant.team_id,
         "player_name": participant.registration.name, "participation_status": participant.participation_status,
+        "avatar_design_id": _avatar_design_id(participant.registration),
     }
 
 
 def match_participants_response(session: Session, fixture: Fixture) -> list[dict]:
     participants = session.scalars(
-        select(MatchParticipant).options(joinedload(MatchParticipant.registration))
+        select(MatchParticipant)
+        .options(joinedload(MatchParticipant.registration).joinedload(Registration.user).joinedload(User.profile))
         .where(MatchParticipant.fixture_id == fixture.id).order_by(MatchParticipant.created_at)
     ).all()
     return [match_participant_to_response(p) for p in participants]

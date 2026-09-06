@@ -89,7 +89,7 @@ def test_player_matches_shows_completed_result_from_each_players_perspective(cli
     assert win_entry["result_type"] == "TEAM_A_WIN"
     assert win_entry["winning_team"]["id"] == team_a["id"]
     assert win_entry["opponent"]["id"] == team_b["id"]
-    assert win_entry["player_of_match_name"] == "Player One"
+    assert win_entry["player_of_match"]["name"] == "Player One"
     assert win_entry["participated"] is True
     assert winner_body["upcoming"] == []
 

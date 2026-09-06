@@ -8,7 +8,7 @@ from ..deps import (
     get_session, organizer_events_filter, publish_event_update, require_admin, require_csrf,
     require_event_access, require_payment_access, require_registration_access,
 )
-from ..models import Match, Organizer, Payment, Registration
+from ..models import Match, Organizer, Payment, Registration, User
 from ..schemas import (
     AdminMatchDetail, EventSummary, EventUpdate, MatchCreate, MatchResponse, PaymentConfigurationResponse,
     PaymentConfigurationUpdate, RegistrationResponse, RejectRequest,
@@ -39,7 +39,12 @@ def admin_create_event(payload: MatchCreate, request: Request, organizer: Organi
 @router.get("/api/admin/events/{match_id}", response_model=AdminMatchDetail)
 @router.get("/api/admin/matches/{match_id}", response_model=AdminMatchDetail)
 def admin_event_detail(match: Match = Depends(require_event_access), session: Session = Depends(get_session)):
-    match = session.scalar(select(Match).options(joinedload(Match.registrations).joinedload(Registration.payment).joinedload(Payment.proofs)).where(Match.id == match.id))
+    match = session.scalar(
+        select(Match).options(
+            joinedload(Match.registrations).joinedload(Registration.payment).joinedload(Payment.proofs),
+            joinedload(Match.registrations).joinedload(Registration.user).joinedload(User.profile),
+        ).where(Match.id == match.id)
+    )
     data = match_to_response(session, match); data["registrations"] = [registration_to_response(item, viewer="organizer", session=session) for item in sorted(match.registrations, key=lambda item: item.created_at, reverse=True)]; return data
 
 
@@ -77,14 +82,22 @@ async def admin_upload_payment_qr(
 @router.get("/api/admin/events/{match_id}/registrations", response_model=list[RegistrationResponse])
 @router.get("/api/admin/matches/{match_id}/registrations", response_model=list[RegistrationResponse])
 def admin_registrations(match: Match = Depends(require_event_access), session: Session = Depends(get_session)):
-    records = session.scalars(select(Registration).options(joinedload(Registration.payment).joinedload(Payment.proofs)).where(Registration.match_id == match.id).order_by(Registration.created_at.desc())).unique().all()
+    records = session.scalars(
+        select(Registration).options(
+            joinedload(Registration.payment).joinedload(Payment.proofs),
+            joinedload(Registration.user).joinedload(User.profile),
+        ).where(Registration.match_id == match.id).order_by(Registration.created_at.desc())
+    ).unique().all()
     return [registration_to_response(item, viewer="organizer", session=session) for item in records]
 
 
 @router.get("/api/admin/payments/pending", response_model=list[RegistrationResponse])
 def pending_payments(organizer: Organizer = Depends(require_admin), session: Session = Depends(get_session)):
     records = session.scalars(
-        select(Registration).options(joinedload(Registration.payment).joinedload(Payment.proofs)).join(Payment).join(Match)
+        select(Registration).options(
+            joinedload(Registration.payment).joinedload(Payment.proofs),
+            joinedload(Registration.user).joinedload(User.profile),
+        ).join(Payment).join(Match)
         .where(Payment.status == PAYMENT_SUBMITTED, organizer_events_filter(organizer))
         .order_by(Payment.submitted_at)
     ).unique().all()

@@ -19,9 +19,10 @@ from ..deps import (
 from ..models import PlayerProfile, PlayerSession, User, now_ist
 from ..rate_limit import enforce_rate_limit_db
 from ..schemas import (
-    OtpRequest, OtpVerify, PlayerAuthResponse, PlayerDashboardResponse, PlayerProfileResponse, PlayerProfileUpdate,
+    AvatarCatalogStatus, AvatarChoose, OtpRequest, OtpVerify, PlayerAuthResponse, PlayerDashboardResponse,
+    PlayerProfileResponse, PlayerProfileUpdate,
 )
-from ..services import player_dashboard
+from ..services import assign_new_avatar, avatar_catalog_status, choose_avatar, player_dashboard
 from ..services_player import request_otp, verify_otp
 
 logger = logging.getLogger("stranger_club")
@@ -92,3 +93,29 @@ def update_profile(payload: PlayerProfileUpdate, player: User = Depends(require_
 @router.get("/api/player/matches", response_model=PlayerDashboardResponse)
 def player_matches(player: User = Depends(require_player), session: Session = Depends(get_session)):
     return player_dashboard(session, player)
+
+
+# ---------------------------------------------------------------------------
+# Avatars. Every endpoint below resolves "which profile" purely from the
+# session-authenticated player (require_player / require_player_csrf) — there
+# is no request field a client could supply to target another player's
+# profile, which is what actually makes "a player can only change their own
+# avatar" true, not just documented.
+# ---------------------------------------------------------------------------
+
+@router.get("/api/player/avatar/options", response_model=AvatarCatalogStatus)
+def get_avatar_options(player: User = Depends(require_player), session: Session = Depends(get_session)):
+    profile = session.scalar(select(PlayerProfile).where(PlayerProfile.user_id == player.id))
+    return avatar_catalog_status(session, profile)
+
+
+@router.post("/api/player/avatar/generate", response_model=PlayerProfileResponse)
+def generate_avatar(player: User = Depends(require_player_csrf), session: Session = Depends(get_session)):
+    profile = session.scalar(select(PlayerProfile).where(PlayerProfile.user_id == player.id))
+    return assign_new_avatar(session, profile)
+
+
+@router.put("/api/player/avatar", response_model=PlayerProfileResponse)
+def put_avatar(payload: AvatarChoose, player: User = Depends(require_player_csrf), session: Session = Depends(get_session)):
+    profile = session.scalar(select(PlayerProfile).where(PlayerProfile.user_id == player.id))
+    return choose_avatar(session, profile, payload.design_id)

@@ -60,6 +60,17 @@ There is no automatic payment verification and no payment gateway.
 - Manually recorded **post-match results**: winner / draw / no-result,
   optional Player of the Match / Best Batter / Best Bowler, and a simple
   participation record — never computed automatically
+- A common landing page (open/joinable events only — never draft, completed,
+  or cancelled) and a persistent player **Profile** page (registrations,
+  upcoming fixtures, recent results), separate from per-event Registration
+- Player **avatars**: a fixed, code-defined catalog of deterministic
+  pixel/identicon designs (`PlayerProfile.avatar_design_id`). A design's
+  *current* owner is enforced by that column's own database UNIQUE
+  constraint — never just a low-collision-probability hash — so one design
+  can never be two players' current avatar at once; releasing one (by
+  switching to another) frees it immediately for reassignment. Nothing about
+  a design's appearance is stored — it's rendered deterministically from the
+  ID alone, client-side (see `src/lib/avatar.js`)
 - Real-time updates (players in the same event see registration/team/match
   changes live) via PostgreSQL `LISTEN`/`NOTIFY`
 - Organizer authentication (Argon2 password hashing, server-side sessions,

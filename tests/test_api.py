@@ -133,7 +133,7 @@ def test_health_public_event_and_migration(client: TestClient):
             assert {"20260818_domain_foundation", "20260818_payment_state_cleanup", "20260906_player_identity"}.issubset(versions)
         else:
             current_head = session.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            assert current_head == "0009"
+            assert current_head == "0010"
 
 
 def test_legacy_database_is_upgraded_without_losing_event_or_payment(tmp_path: Path):
@@ -1071,10 +1071,10 @@ def test_player_can_view_and_update_own_profile(client: TestClient):
     player_headers = player_login(client, "9877900001")
     profile = client.get("/api/player/profile", headers=player_headers)
     assert profile.status_code == 200
-    assert profile.json() == {"display_name": None, "cricket_role": "NO_PREFERENCE", "skill_rating": None, "bio": None}
+    assert profile.json() == {"display_name": None, "cricket_role": "NO_PREFERENCE", "skill_rating": None, "bio": None, "avatar_design_id": None}
     updated = client.patch("/api/player/profile", headers=player_headers, json={"display_name": "Test Player", "cricket_role": "BOWLER", "skill_rating": 7})
     assert updated.status_code == 200
-    assert updated.json() == {"display_name": "Test Player", "cricket_role": "BOWLER", "skill_rating": 7, "bio": None}
+    assert updated.json() == {"display_name": "Test Player", "cricket_role": "BOWLER", "skill_rating": 7, "bio": None, "avatar_design_id": None}
 
 
 def test_profile_requires_authentication(client: TestClient):

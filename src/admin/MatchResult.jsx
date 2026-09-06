@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { LoaderCircle, Pencil } from 'lucide-react';
+import Avatar from '../components/Avatar';
 import { api } from '../lib/api';
 
 const RESULT_LABEL = (fixture, result) => {
@@ -121,9 +122,9 @@ export default function MatchResult({ fixture, eventId, toast }) {
       <div className="result-summary">
         <p className="eyebrow">RESULT</p>
         <h3>{RESULT_LABEL(fixture, savedResult)}</h3>
-        {savedResult.player_of_match && <div><small>PLAYER OF THE MATCH</small><b>{savedResult.player_of_match.name}</b></div>}
-        {savedResult.best_batter && <div><small>BEST BATTER</small><b>{savedResult.best_batter.name}</b></div>}
-        {savedResult.best_bowler && <div><small>BEST BOWLER</small><b>{savedResult.best_bowler.name}</b></div>}
+        {savedResult.player_of_match && <div><small>PLAYER OF THE MATCH</small><b><Avatar designId={savedResult.player_of_match.avatar_design_id} name={savedResult.player_of_match.name} size={22} /> {savedResult.player_of_match.name}</b></div>}
+        {savedResult.best_batter && <div><small>BEST BATTER</small><b><Avatar designId={savedResult.best_batter.avatar_design_id} name={savedResult.best_batter.name} size={22} /> {savedResult.best_batter.name}</b></div>}
+        {savedResult.best_bowler && <div><small>BEST BOWLER</small><b><Avatar designId={savedResult.best_bowler.avatar_design_id} name={savedResult.best_bowler.name} size={22} /> {savedResult.best_bowler.name}</b></div>}
         <div><small>PARTICIPATION</small><b>{participantIds.size} PLAYER{participantIds.size === 1 ? '' : 'S'}</b></div>
         {savedResult.notes && <div><small>NOTES</small><b>{savedResult.notes}</b></div>}
         <button className="ghost-button" onClick={() => setEditing(true)}><Pencil size={15} /> EDIT RESULT</button>
@@ -146,7 +147,7 @@ export default function MatchResult({ fixture, eventId, toast }) {
       <section className="list"><div>
         {allMembers.map((member) => (
           <label className="player-row" key={member.registration_id}>
-            <span className="avatar">{member.player_name[0]}</span>
+            <Avatar designId={member.avatar_design_id} name={member.player_name} />
             <span><b>{member.player_name}</b><small>{member.team_name}</small></span>
             <input type="checkbox" checked={participantIds.has(member.registration_id)} onChange={() => toggleParticipant(member.registration_id)} />
           </label>
