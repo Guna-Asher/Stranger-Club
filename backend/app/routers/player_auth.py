@@ -18,7 +18,10 @@ from ..deps import (
 )
 from ..models import PlayerProfile, PlayerSession, User, now_ist
 from ..rate_limit import enforce_rate_limit_db
-from ..schemas import OtpRequest, OtpVerify, PlayerAuthResponse, PlayerProfileResponse, PlayerProfileUpdate
+from ..schemas import (
+    OtpRequest, OtpVerify, PlayerAuthResponse, PlayerDashboardResponse, PlayerProfileResponse, PlayerProfileUpdate,
+)
+from ..services import player_dashboard
 from ..services_player import request_otp, verify_otp
 
 logger = logging.getLogger("stranger_club")
@@ -84,3 +87,8 @@ def update_profile(payload: PlayerProfileUpdate, player: User = Depends(require_
         setattr(profile, field, value)
     session.commit(); session.refresh(profile)
     return profile
+
+
+@router.get("/api/player/matches", response_model=PlayerDashboardResponse)
+def player_matches(player: User = Depends(require_player), session: Session = Depends(get_session)):
+    return player_dashboard(session, player)

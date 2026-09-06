@@ -1,9 +1,9 @@
 import { useState } from 'react';
-import { ArrowLeft, CalendarPlus, CheckCircle2, ChevronRight, Share2 } from 'lucide-react';
+import { ArrowLeft, CalendarPlus, ChevronRight, Share2 } from 'lucide-react';
 import Status from '../components/Status';
 import CancelConfirm from './CancelConfirm';
 import { api } from '../lib/api';
-import { cn, dateText, playerStatus, timeText } from '../lib/format';
+import { dateText, playerStatus, timeText } from '../lib/format';
 
 const CANCELLABLE_REGISTRATION_STATUSES = new Set(['PENDING', 'WAITLISTED', 'CONFIRMED']);
 const CANCELLABLE_EVENT_STATUSES = new Set(['DRAFT', 'OPEN', 'FULL']);
@@ -21,7 +21,7 @@ export default function PlayerStatus({ match, registration, teamInfo, fixtures, 
   const upcomingFixture = confirmed ? fixtures?.find((f) => f.my_team_id && (f.status === 'SCHEDULED' || f.status === 'IN_PROGRESS')) : null;
   const opponent = upcomingFixture && (upcomingFixture.team_a.id === upcomingFixture.my_team_id ? upcomingFixture.team_b : upcomingFixture.team_a);
   const completedFixtures = confirmed ? (fixtures || []).filter((f) => f.my_team_id && f.status === 'COMPLETED' && f.result) : [];
-  return <section className="status-page"><button className="back" onClick={back}><ArrowLeft /> MATCH DETAILS</button><div className={cn('status-icon', confirmed && 'success', rejected && 'danger')}><CheckCircle2 /></div><p className="eyebrow">{dateText(match.date)}</p><h1>{content[0]}</h1><p>{content[1]}</p><div className="ticket"><div><b>{match.name}</b><span>{timeText(match.start_time)} · {match.venue}</span></div><Status status={playerStatus(registration)} /><footer><small>PAYMENT</small><strong>{confirmed ? `₹${registration.payment?.amount_due}` : submitted ? 'VERIFYING' : waitlisted ? 'WAITLISTED' : cancelled ? '—' : 'REUPLOAD'}</strong></footer></div>
+  return <section className="status-page"><button className="back" onClick={back}><ArrowLeft /> MATCH DETAILS</button><p className="eyebrow status-page-eyebrow">{dateText(match.date)}</p><h1>{content[0]}</h1><p>{content[1]}</p><div className="ticket"><div><b>{match.name}</b><span>{timeText(match.start_time)} · {match.venue}</span></div><Status status={playerStatus(registration)} /><footer><small>PAYMENT</small><strong>{confirmed ? `₹${registration.payment?.amount_due}` : submitted ? 'VERIFYING' : waitlisted ? 'WAITLISTED' : cancelled ? '—' : 'REUPLOAD'}</strong></footer></div>
     {myTeam && <div className="ticket"><div><b>YOUR TEAM: {myTeam.name.toUpperCase()}</b><span>{teamInfo.teammates.length === 0 ? 'No teammates assigned yet' : teamInfo.teammates.map((t) => t.name).join(', ')}</span></div></div>}
     {upcomingFixture && <div className="ticket"><div><b>VS {opponent.name.toUpperCase()}</b><span>{dateText(upcomingFixture.scheduled_at.slice(0, 10))} · {timeText(upcomingFixture.scheduled_at.slice(11, 16))} · {upcomingFixture.venue_override || match.venue}</span></div><Status status={upcomingFixture.status} /></div>}
     {completedFixtures.map((f) => (

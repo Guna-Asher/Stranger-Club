@@ -1192,6 +1192,121 @@ def player_fixtures_response(session: Session, match: Match, user: User) -> list
     ]
 
 
+def player_dashboard(session: Session, user: User) -> dict:
+    """Cross-event summary for the authenticated player's persistent Profile
+    page: their active registrations, upcoming fixtures, and completed
+    fixtures with results, across every event they've ever registered for —
+    batched (not one query per event) for the same N+1-avoidance reason as
+    player_fixtures_response above. No career statistics: this only ever
+    surfaces the same organizer-entered facts player_fixtures_response does,
+    one event at a time.
+    """
+    registrations = session.scalars(
+        select(Registration).options(joinedload(Registration.match), joinedload(Registration.payment))
+        .where(Registration.user_id == user.id, Registration.status.in_(ACTIVE_REGISTRATION_STATUSES))
+        .order_by(Registration.created_at.desc())
+    ).unique().all()
+
+    reg_ids = [r.id for r in registrations]
+    members_by_registration: dict[int, TeamMember] = {}
+    if reg_ids:
+        members_by_registration = {
+            m.registration_id: m for m in session.scalars(select(TeamMember).where(TeamMember.registration_id.in_(reg_ids))).all()
+        }
+    my_team_id_by_event: dict[int, int] = {
+        reg.match_id: members_by_registration[reg.id].team_id for reg in registrations if reg.id in members_by_registration
+    }
+
+    team_ids = {m.team_id for m in members_by_registration.values()}
+    teams_by_id = {t.id: t for t in session.scalars(select(Team).where(Team.id.in_(team_ids))).all()} if team_ids else {}
+
+    fixtures: list[Fixture] = []
+    if team_ids:
+        fixtures = session.scalars(
+            select(Fixture).options(joinedload(Fixture.team_a), joinedload(Fixture.team_b))
+            .where(or_(Fixture.team_a_id.in_(team_ids), Fixture.team_b_id.in_(team_ids)))
+            .order_by(Fixture.scheduled_at)
+        ).unique().all()
+
+    fixture_ids = [f.id for f in fixtures]
+    results_by_fixture: dict[int, MatchResult] = {}
+    my_participation: set[int] = set()
+    if fixture_ids:
+        results_by_fixture = {
+            r.fixture_id: r for r in session.scalars(select(MatchResult).where(MatchResult.fixture_id.in_(fixture_ids))).all()
+        }
+        if reg_ids:
+            my_participation = set(session.scalars(
+                select(MatchParticipant.fixture_id).where(
+                    MatchParticipant.fixture_id.in_(fixture_ids), MatchParticipant.registration_id.in_(reg_ids),
+                )
+            ))
+
+    winning_team_ids = {r.winning_team_id for r in results_by_fixture.values() if r.winning_team_id is not None}
+    winner_teams_by_id = (
+        {t.id: t for t in session.scalars(select(Team).where(Team.id.in_(winning_team_ids))).all()} if winning_team_ids else {}
+    )
+    award_registration_ids = {
+        rid for r in results_by_fixture.values()
+        for rid in (r.player_of_match_registration_id, r.best_batter_registration_id, r.best_bowler_registration_id)
+        if rid is not None
+    }
+    award_registrations_by_id = (
+        {r.id: r for r in session.scalars(select(Registration).where(Registration.id.in_(award_registration_ids))).all()}
+        if award_registration_ids else {}
+    )
+
+    def team_summary(team: Team | None) -> dict | None:
+        return {"id": team.id, "name": team.name, "short_code": team.short_code} if team else None
+
+    def award_name(registration_id: int | None) -> str | None:
+        award_registration = award_registrations_by_id.get(registration_id) if registration_id else None
+        return award_registration.name if award_registration else None
+
+    upcoming: list[dict] = []
+    completed: list[dict] = []
+    for f in fixtures:
+        my_team_id = my_team_id_by_event.get(f.event_id)
+        if my_team_id not in (f.team_a_id, f.team_b_id):
+            continue
+        opponent = f.team_b if my_team_id == f.team_a_id else f.team_a
+        entry = {
+            "id": f.id, "event_id": f.event_id, "scheduled_at": f.scheduled_at,
+            "venue_override": f.venue_override, "status": f.status, "opponent": team_summary(opponent),
+        }
+        if f.status in ("SCHEDULED", "IN_PROGRESS"):
+            upcoming.append(entry)
+        elif f.status == "COMPLETED" and f.id in results_by_fixture:
+            result = results_by_fixture[f.id]
+            completed.append({
+                **entry,
+                "result_type": result.result_type,
+                "winning_team": team_summary(winner_teams_by_id.get(result.winning_team_id)),
+                "player_of_match_name": award_name(result.player_of_match_registration_id),
+                "best_batter_name": award_name(result.best_batter_registration_id),
+                "best_bowler_name": award_name(result.best_bowler_registration_id),
+                "participated": f.id in my_participation,
+            })
+    completed.sort(key=lambda entry: entry["scheduled_at"], reverse=True)
+
+    return {
+        "registrations": [
+            {
+                "public_id": reg.public_id, "status": reg.status,
+                "payment_status": reg.payment.status if reg.payment else None,
+                "event": {
+                    "public_id": reg.match.public_id, "name": reg.match.name, "date": reg.match.date,
+                    "venue": reg.match.venue, "status": reg.match.status,
+                },
+                "team": team_summary(teams_by_id.get(members_by_registration[reg.id].team_id)) if reg.id in members_by_registration else None,
+            }
+            for reg in registrations
+        ],
+        "upcoming": upcoming,
+        "completed": completed,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Phase 5: post-match Results, Awards, and Participation. No automatic
 # computation anywhere in this block — every field here is organizer-entered.

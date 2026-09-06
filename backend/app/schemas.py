@@ -526,3 +526,49 @@ class MatchResultResponse(BaseModel):
     finalized_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Persistent player Profile page: a cross-event summary, batched server-side
+# (see services.player_dashboard) so the page never has to fan out one
+# request per event the player has ever registered for.
+# ---------------------------------------------------------------------------
+
+class PlayerDashboardEventSummary(BaseModel):
+    public_id: str
+    name: str
+    date: date_type
+    venue: str
+    status: str
+
+
+class PlayerDashboardRegistration(BaseModel):
+    public_id: str
+    status: str
+    payment_status: str | None = None
+    event: PlayerDashboardEventSummary
+    team: TeamSummary | None = None
+
+
+class PlayerDashboardFixture(BaseModel):
+    id: int
+    event_id: int
+    scheduled_at: datetime
+    venue_override: str | None = None
+    status: str
+    opponent: TeamSummary | None = None
+
+
+class PlayerDashboardCompletedFixture(PlayerDashboardFixture):
+    result_type: str
+    winning_team: TeamSummary | None = None
+    player_of_match_name: str | None = None
+    best_batter_name: str | None = None
+    best_bowler_name: str | None = None
+    participated: bool = False
+
+
+class PlayerDashboardResponse(BaseModel):
+    registrations: list[PlayerDashboardRegistration]
+    upcoming: list[PlayerDashboardFixture]
+    completed: list[PlayerDashboardCompletedFixture]

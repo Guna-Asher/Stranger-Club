@@ -38,6 +38,7 @@ h1, h2, h3, p { margin: 0; }
 .date-lock b { color: #d4ff36; font: 700 48px/.9 'Space Grotesk'; letter-spacing: -.07em; }
 .date-lock span { border-left: 1px solid #ffffff55; color: #d8ddd8; font: 10px/1.25 'DM Mono'; letter-spacing: .08em; padding-left: 10px; text-transform: uppercase; }
 .hero-copy > p:last-child { align-items: center; color: #d8ddd8; display: flex; font-size: 13px; font-weight: 600; gap: 7px; margin-top: 17px; }
+.landing-copy .primary-button { margin-top: 8px; }
 .field-graphic { bottom: -1px; height: 222px; pointer-events: none; position: absolute; right: -43px; width: 230px; }
 .field-graphic > div { border: 2px solid #d4ff36; border-radius: 50%; height: 230px; opacity: .8; position: relative; width: 230px; }
 .field-graphic > div:before, .field-graphic > div:after { background: #d4ff36; content: ''; height: 2px; left: 0; position: absolute; top: 50%; width: 100%; }
@@ -122,10 +123,7 @@ h1, h2, h3, p { margin: 0; }
 .status-page { padding-top: 23px; text-align: center; }
 .back { color: #4e554f; font: 10px 'DM Mono'; gap: 6px; letter-spacing: .06em; }
 .back svg { height: 18px; width: 18px; }
-.status-icon { align-items: center; background: #e1e5df; border-radius: 50%; color: #5a625b; display: inline-flex; height: 72px; justify-content: center; margin: 67px auto 22px; width: 72px; }
-.status-icon svg { height: 37px; width: 37px; }
-.status-icon.success { background: #d4ff36; color: #101411; }
-.status-icon.danger { background: #fee4e2; color: #b42318; }
+.status-page-eyebrow { margin-top: 28px; }
 .status-page > p:not(.eyebrow) { margin: 0 auto; max-width: 350px; }
 .ticket { background: #101411; border-radius: 15px; color: white; margin: 31px 0 18px; overflow: hidden; padding: 18px; text-align: left; }
 .ticket > div:first-child { display: flex; flex-direction: column; gap: 5px; }
@@ -164,6 +162,8 @@ h1, h2, h3, p { margin: 0; }
 .tabs { display: grid; gap: 8px; grid-template-columns: 1fr 1fr 1fr; margin: 0 0 24px; }.tabs button { background: #e3e7e1; border: 0; border-radius: 10px; color: #4e554f; font: 10px 'DM Mono'; letter-spacing: .06em; min-height: 42px; }.tabs button.active { background: #101411; color: #d4ff36; }
 .list > div > p.quiet { padding: 16px 14px; }
 .match-card { background: white; border-radius: 13px; padding: 14px 14px 4px; }.match-card > div:first-child { align-items: center; display: flex; gap: 10px; justify-content: space-between; padding-bottom: 12px; }.match-card b { font-size: 13px; }.match-card small { color: #737a74; display: block; font-size: 10px; margin-top: 3px; }.match-card .share-buttons { margin: 0 0 14px; }
+.form-actions { display: flex; gap: 10px; margin-top: 8px; }.form-actions > button { flex: 1; }
+.result-summary { padding: 4px 0 14px; }.result-summary h3 { font: 700 22px 'Space Grotesk'; letter-spacing: -.045em; margin: 4px 0 16px; }.result-summary > div { margin-bottom: 14px; }.result-summary small { color: #7a817b; display: block; font: 9px 'DM Mono'; letter-spacing: .1em; margin-bottom: 4px; }.result-summary b { font-size: 14px; }.result-summary .ghost-button { margin-top: 4px; width: 100%; }
 .login-page { align-items: center; background: #101411; color: white; display: flex; flex-direction: column; justify-content: center; min-height: 100vh; padding: 28px 22px; }.login-page > section { margin-top: 55px; max-width: 420px; width: 100%; }.login-page h1 { font: 700 42px/.9 'Space Grotesk'; letter-spacing: -.08em; margin: 12px 0; }.login-page section > p:not(.eyebrow) { color: #b9c0ba; font-size: 14px; margin-bottom: 30px; }.login-page .field > span { color: #cbd1cb; }.login-page .primary-button { width: 100%; }
 .pair { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }.admin-form { padding-bottom: 20px; }
 

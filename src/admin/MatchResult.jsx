@@ -1,6 +1,13 @@
 import { useEffect, useState } from 'react';
-import { LoaderCircle } from 'lucide-react';
+import { LoaderCircle, Pencil } from 'lucide-react';
 import { api } from '../lib/api';
+
+const RESULT_LABEL = (fixture, result) => {
+  if (result.result_type === 'DRAW') return 'MATCH DRAWN';
+  if (result.result_type === 'NO_RESULT') return 'NO RESULT';
+  const winner = result.winning_team?.id === fixture.team_a.id ? fixture.team_a : fixture.team_b;
+  return `${winner.name.toUpperCase()} WON`;
+};
 
 const RESULT_OPTIONS = (fixture) => [
   { value: 'TEAM_A_WIN', label: `${fixture.team_a.name.toUpperCase()} WIN` },
@@ -17,7 +24,12 @@ export default function MatchResult({ fixture, eventId, toast }) {
   const [bestBatterId, setBestBatterId] = useState('');
   const [bestBowlerId, setBestBowlerId] = useState('');
   const [notes, setNotes] = useState('');
-  const [hasExistingResult, setHasExistingResult] = useState(false);
+  // The authoritative saved result, straight from the backend — null until a
+  // GET (or a save) actually returns one. Whether the editable form or the
+  // saved summary renders is driven entirely by this, not by local-only UI
+  // state, so a page reload always shows exactly what the server has.
+  const [savedResult, setSavedResult] = useState();
+  const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const load = async () => {
@@ -32,14 +44,15 @@ export default function MatchResult({ fixture, eventId, toast }) {
 
       try {
         const result = await api(`/admin/fixtures/${fixture.id}/result`);
-        setHasExistingResult(true);
+        setSavedResult(result);
         setResultType(result.result_type);
         setMvpId(result.player_of_match ? String(result.player_of_match.registration_id) : '');
         setBestBatterId(result.best_batter ? String(result.best_batter.registration_id) : '');
         setBestBowlerId(result.best_bowler ? String(result.best_bowler.registration_id) : '');
         setNotes(result.notes || '');
       } catch {
-        setHasExistingResult(false);
+        setSavedResult(undefined);
+        setEditing(true);
       }
     } catch (err) { toast(err.message); }
   };
@@ -89,14 +102,34 @@ export default function MatchResult({ fixture, eventId, toast }) {
         best_bowler_registration_id: bestBowlerId ? +bestBowlerId : null,
         notes: notes || null,
       };
-      await api(`/admin/fixtures/${fixture.id}/result`, {
-        method: hasExistingResult ? 'PATCH' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      const saved = await api(`/admin/fixtures/${fixture.id}/result`, {
+        method: savedResult ? 'PATCH' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
       });
-      setHasExistingResult(true);
+      setSavedResult(saved);
+      setEditing(false);
       toast('Result saved');
       await load();
     } catch (err) { toast(err.message); } finally { setBusy(false); }
   };
+
+  // Discards any in-progress edits by re-syncing form fields from the last
+  // saved result, rather than trusting whatever the organizer typed.
+  const cancelEdit = async () => { await load(); setEditing(false); };
+
+  if (savedResult && !editing) {
+    return (
+      <div className="result-summary">
+        <p className="eyebrow">RESULT</p>
+        <h3>{RESULT_LABEL(fixture, savedResult)}</h3>
+        {savedResult.player_of_match && <div><small>PLAYER OF THE MATCH</small><b>{savedResult.player_of_match.name}</b></div>}
+        {savedResult.best_batter && <div><small>BEST BATTER</small><b>{savedResult.best_batter.name}</b></div>}
+        {savedResult.best_bowler && <div><small>BEST BOWLER</small><b>{savedResult.best_bowler.name}</b></div>}
+        <div><small>PARTICIPATION</small><b>{participantIds.size} PLAYER{participantIds.size === 1 ? '' : 'S'}</b></div>
+        {savedResult.notes && <div><small>NOTES</small><b>{savedResult.notes}</b></div>}
+        <button className="ghost-button" onClick={() => setEditing(true)}><Pencil size={15} /> EDIT RESULT</button>
+      </div>
+    );
+  }
 
   return (
     <div className="form">
@@ -140,9 +173,12 @@ export default function MatchResult({ fixture, eventId, toast }) {
         </select>
       </label>
       <label className="field"><span>NOTES (OPTIONAL)</span><textarea value={notes} onChange={(e) => setNotes(e.target.value)} /></label>
-      <button className="primary-button" disabled={busy || !resultType} onClick={save}>
-        {busy ? <LoaderCircle className="spin" /> : 'SAVE RESULT'}
-      </button>
+      <div className="form-actions">
+        <button className="primary-button" disabled={busy || !resultType} onClick={save}>
+          {busy ? <LoaderCircle className="spin" /> : 'SAVE RESULT'}
+        </button>
+        {savedResult && <button className="ghost-button" disabled={busy} onClick={cancelEdit}>CANCEL</button>}
+      </div>
     </div>
   );
 }

@@ -1,8 +1,9 @@
 import { BrowserRouter, Route, Routes, useParams } from 'react-router-dom';
 import AdminLogin from './admin/AdminLogin';
 import AdminApp from './admin/AdminApp';
+import Landing from './player/Landing';
 import PlayerApp from './player/PlayerApp';
-import { DEFAULT_MATCH } from './lib/constants';
+import Profile from './player/Profile';
 import './index.css';
 
 function PlayerRoute() {
@@ -16,9 +17,11 @@ export default function App() {
       <Routes>
         <Route path="/admin/login" element={<AdminLogin />} />
         <Route path="/admin/*" element={<AdminApp />} />
+        <Route path="/profile" element={<Profile />} />
         <Route path="/m/:publicId/*" element={<PlayerRoute />} />
         <Route path="/events/:publicId/*" element={<PlayerRoute />} />
-        <Route path="*" element={<PlayerApp publicId={DEFAULT_MATCH} />} />
+        <Route path="/" element={<Landing />} />
+        <Route path="*" element={<Landing />} />
       </Routes>
     </BrowserRouter>
   );
