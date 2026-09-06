@@ -1,218 +1,319 @@
 # Stranger Club
 
-Stranger Club is a mobile-first platform for organizing stranger-cricket
-events — from registration and external payment through confirmation,
-teams, matches, and post-match results.
+Real strangers. Real cricket. A production-oriented platform for
+discovering, organizing, and playing community cricket matches.
 
-It is **not** a cricket scoring platform. Detailed ball-by-ball scoring,
-scorecards, and statistics can stay in an external tool such as CricHeroes;
-Stranger Club owns the operational workflow around getting people
-registered, paid, confirmed, organized into teams, and the basic record of
-what happened afterward.
+Stranger Club replaces the manual "Google Form → UPI QR → payment
+screenshot → WhatsApp confirmation" workflow organizers use to run weekly
+pickup cricket games, and extends it into the layer on top: turning
+confirmed players into teams, scheduling matches between them, and keeping
+a basic record of what happened. It is a backend-first system — FastAPI +
+PostgreSQL as the source of truth, a React frontend, and a deliberately
+small infrastructure footprint (one application process, one database, one
+object store).
+
+It is **not** a live scoring platform. Ball-by-ball input, scorecards, and
+detailed statistics are explicitly out of scope — see [§4](#4-what-is-intentionally-not-included).
 
 ---
 
-## 1. What Stranger Club is
+## 1. Status
 
-A single system replacing the manual "Google Form → UPI QR → payment
-screenshot → WhatsApp confirmation" workflow organizers were using to run
-weekly pickup cricket games, plus the layer on top of that: turning
-confirmed players into teams, scheduling matches between them, and
-recording the result.
+- Core product workflows described below — registration, OTP
+  authentication, external UPI payment + proof review, waitlisting, teams,
+  fixtures, and results — are implemented and covered by the test suite in
+  [§8](#8-testing).
+- The application has been deployed to cloud infrastructure for controlled
+  testing with a small group of real users, using a real PostgreSQL
+  database and real S3-compatible object storage.
+- Two things are intentionally deferred to a later deployment stage: a
+  production SMS/OTP delivery provider, and a permanent public domain. Both
+  are configuration-level integrations, not architectural gaps — the
+  application's OTP and auth flows are provider-agnostic by design (see
+  [`backend/app/otp/base.py`](backend/app/otp/base.py)).
+- This repository is public for portfolio and technical-review purposes.
 
-## 2. Core workflow
+## 2. Product
 
 **Player**
 
 ```
-register → pay externally via UPI → upload payment proof
-  → organizer verifies → slot confirmed / waitlisted
-  → team assigned → match played → post-match result recorded
+discover event → register → authenticate (OTP)
+  → submit payment proof → confirmed / waitlisted
+  → join team → play fixture → view result / history
 ```
 
 **Organizer**
 
 ```
-create event → manage registrations → verify payments
-  → manage teams → schedule matches → complete matches
-  → record result / MVP / basic participation
+create event → configure payment → review proofs
+  → manage registrations → create teams → assign players
+  → create fixtures → record results / MVP / awards
 ```
 
-Payment happens **externally**, over UPI, between the player and the
-organizer — Stranger Club never touches money. It generates the UPI
+Payment happens **externally**, over UPI, directly between the player and
+the organizer — Stranger Club never touches money. It generates the UPI
 request (deep link / QR), accepts an uploaded screenshot as evidence, and
-gives the organizer a review screen to confirm or reject that evidence.
-There is no automatic payment verification and no payment gateway.
+gives the organizer a review screen to confirm or reject it. There is no
+payment gateway and no automatic payment verification.
 
-## 3. Current capabilities
+## 3. Core features
 
-- Player registration (no player account required to view an event; OTP
-  phone verification to register/track status), with a FIFO waitlist once
-  an event is full
-- Organizer-configured UPI payment details, server-generated payment
-  request per registration, payment-proof screenshot upload with
-  duplicate-screenshot detection
-- Organizer review: confirm / reject payment proofs, promote from waitlist
-- Organizer-managed **Teams** scoped to one event, with manual player
-  assignment
-- Organizer-scheduled **Matches** between two teams of the same event
-  (`SCHEDULED → IN_PROGRESS → COMPLETED`, or `CANCELLED`)
-- Manually recorded **post-match results**: winner / draw / no-result,
-  optional Player of the Match / Best Batter / Best Bowler, and a simple
-  participation record — never computed automatically
-- A common landing page (open/joinable events only — never draft, completed,
-  or cancelled) and a persistent player **Profile** page (registrations,
-  upcoming fixtures, recent results), separate from per-event Registration
-- Player **avatars**: a fixed, code-defined catalog of deterministic
-  pixel/identicon designs (`PlayerProfile.avatar_design_id`). A design's
-  *current* owner is enforced by that column's own database UNIQUE
-  constraint — never just a low-collision-probability hash — so one design
-  can never be two players' current avatar at once; releasing one (by
-  switching to another) frees it immediately for reassignment. Nothing about
-  a design's appearance is stored — it's rendered deterministically from the
-  ID alone, client-side (see `src/lib/avatar.js`)
-- Real-time updates (players in the same event see registration/team/match
-  changes live) via PostgreSQL `LISTEN`/`NOTIFY`
-- Organizer authentication (Argon2 password hashing, server-side sessions,
-  CSRF protection, `ORGANIZER`/`PLATFORM_ADMIN` roles) and player
-  authentication (OTP-over-phone, separate server-side sessions)
+Grouped by domain. Everything listed here exists in this codebase today.
+
+**Identity & Access**
+- Player authentication via phone OTP, separate from organizer identity
+- Organizer authentication (Argon2 password hashing) with `ORGANIZER` /
+  `PLATFORM_ADMIN` roles
+- Persistent player profiles, independent of any single event registration
+- Server-side sessions for both identities, with hashed session tokens
+
+**Events & Registration**
+- Event lifecycle: `DRAFT → OPEN → FULL → ONGOING → COMPLETED` /
+  `CANCELLED`
+- Registration with capacity enforcement
+- FIFO waitlist with promotion on cancellation
+- Cancellation and re-registration handling
+
+**Payments**
+- Organizer-configured UPI payee details per event
+- Per-registration payment snapshot (amount, payee details at time of
+  registration)
+- Payment-proof screenshot upload, with duplicate-screenshot detection
+- Organizer review: confirm or reject, with waitlist promotion on capacity
+  changes
+- Append-only payment evidence — proofs are never deleted, only superseded
+
+**Teams & Matches**
+- Organizer-managed teams scoped to one event
+- Manual roster assignment, with capacity enforcement
+- Fixture scheduling between two teams of the same event
+- Roster locking once a team has played
+- Fixture lifecycle: `SCHEDULED → IN_PROGRESS → COMPLETED` / `CANCELLED`
+
+**Results & Player History**
+- Manually recorded match results: winner / draw / no-result
+- Per-fixture participant records (who actually played, for which team)
+- Optional Player of the Match / Best Batter / Best Bowler awards
+- Player profile page: registrations, upcoming fixtures, recent results
+
+**Platform**
+- Realtime updates (registration/team/fixture changes) via PostgreSQL
+  `LISTEN`/`NOTIFY`
 - Audit log of every meaningful state change
-- PostgreSQL in production, SQLite for local development/tests; S3-compatible
-  object storage for payment-proof/QR images
+- Distributed, database-backed rate limiting
+- Per-request correlation IDs threaded through logs and error responses
+- `/health` and `/ready` endpoints (readiness includes a migration-head
+  check)
+- S3-compatible object storage for payment-proof and QR images
+- Docker-based deployment (single multi-stage image)
 
 ## 4. What is intentionally NOT included
 
-The product stops deliberately at the boundary above. None of the
-following exist in this codebase today:
-
-- Media Hub, photo/media uploads, Instagram or CricHeroes API integration
+- Media hub, photo/media uploads, or third-party scoring-app integration
 - Live scoring, ball-by-ball input, an innings engine, or scorecards
-- Automatic MVP/result computation, player ratings, Elo, rankings, or
-  leaderboards
+- Automatic MVP/result computation, ratings, rankings, or leaderboards
 - AI-assisted team balancing or tournament/bracket engines
 - Social feed, chat, or a notifications platform
-- Subscriptions, a payment gateway, or wallet functionality
-- City/multi-city architecture or multiple sports
+- Payment gateway or wallet functionality
+- Multi-city or multi-sport architecture
 
-## 5. Architecture
+## 5. Engineering highlights
+
+The project is built around backend correctness — the database enforces
+the invariants that matter, not just the application code.
+
+**Database integrity**
+- PostgreSQL is production-authoritative; SQLite is development/test-only
+  and the app refuses to boot against it in `staging`/`production`
+  (`backend/app/config.py`)
+- Composite foreign keys make cross-event data corruption structurally
+  impossible to insert — e.g. a `TeamMember` row can only reference a team
+  and a registration that both resolve to the *same* event
+  (`backend/app/models.py`)
+- Partial unique indexes enforce business rules at the row level: one
+  active registration per player per event, one pending payment proof per
+  payment, one fixture sequence value per event when set
+- A player's avatar design is enforced unique at the database level (a
+  `UNIQUE` constraint on the design column), not by a low-collision-odds
+  hash
+
+**Concurrency**
+- Capacity-sensitive writes (registration, payment review, team
+  assignment, waitlist promotion) use `SELECT ... FOR UPDATE` on
+  PostgreSQL and `BEGIN IMMEDIATE` on SQLite — a real row lock, not an
+  optimistic retry
+- Locks are taken on the resource whose capacity the decision actually
+  depends on (the event, not the individual payment or registration row)
+- Realtime (`LISTEN`/`NOTIFY`) is treated purely as a signal to refetch —
+  the database, not a dropped or delayed notification, is the source of
+  truth
+
+**Security**
+- Every ownership check (event, team, fixture, registration, payment)
+  re-verifies on every request and returns `404` — never `403` — on a
+  mismatch, so a non-owner can't confirm a resource even exists
+- OTP codes and session tokens are stored as hashes, never in plaintext
+- Rate limiting on login, OTP request/verify, and payment-related
+  endpoints, backed by atomic PostgreSQL counters shared across instances
+- Object storage credentials have no delete permission on payment-proof
+  data; every read is authorized per-request through a short-lived
+  presigned URL
+- Least-privilege database roles: separate migration, application, and
+  backup credentials, none with more privilege than its job needs
+- Production configuration fails fast — a missing or invalid required
+  environment variable stops startup with a specific error, never a silent
+  insecure default
+
+**Reliability**
+- `/ready` fails closed if the database is unreachable or its
+  `alembic_version` doesn't match the code's expected migration head
+- Migrations run through a single explicit code path guarded by a
+  PostgreSQL advisory lock, so concurrent deploys can't race each other
+- Dockerfile `HEALTHCHECK` targets `/ready`, not `/health` — an
+  unreachable or un-migrated database is reported unhealthy
+- The container can run with a read-only root filesystem plus a `tmpfs`
+  mount for `/tmp` once storage is S3 and the database is PostgreSQL
+
+## 6. Architecture
 
 ```
-Browser (mobile-first SPA)
+Browser (React SPA)
         │
         ▼
-FastAPI backend  ──►  PostgreSQL (production) / SQLite (dev, tests)
+FastAPI backend  ──►  PostgreSQL (production authority)
         │                    │
-        │                    └─ LISTEN/NOTIFY realtime, distributed
-        │                       rate limiting, audit log, migrations
+        │                    └─ LISTEN/NOTIFY realtime, rate-limit
+        │                       counters, audit log, migrations
         ▼
 S3-compatible object storage (payment-proof screenshots, QR images)
 ```
 
-- **Authentication**: two separate identities — `Organizer` (password +
-  Argon2, server-side session, CSRF token, `ORGANIZER`/`PLATFORM_ADMIN`
-  role) and `User`/player (phone OTP, its own server-side session). Neither
-  shares a session mechanism with the other.
-- **Authorization**: every organizer-scoped resource (event, team, match,
-  registration, payment) independently re-verifies ownership on every
-  request; a non-owner gets `404`, never `403`, so existence itself isn't
-  leaked. `PLATFORM_ADMIN` can act on any organizer's data.
-- **Payment-proof storage**: private object storage, opaque generated keys,
-  no public URLs — every read is authorized per-request and served through
-  a short-lived presigned URL (S3) or streamed directly (local dev only).
-  The runtime credential has no delete permission — evidence is append-only.
-- **Realtime**: PostgreSQL `LISTEN`/`NOTIFY` in production (an in-process
-  fallback backs local SQLite dev) — the database is always the source of
-  truth; a dropped notification is safe because clients refetch.
-- **Rate limiting**: atomic PostgreSQL-backed counters, shared correctly
-  across multiple application instances (no in-process state).
-- **Audit logging**: one `AuditLog` table records actor, action, target, and
-  before/after state for every meaningful mutation.
-- **Migrations**: Alembic is the sole source of schema truth from its
-  baseline forward, applied through a single explicit code path, guarded by
-  a PostgreSQL advisory lock so concurrent deploys never race.
-- **Health/readiness**: `/health` (process alive) and `/ready` (database
-  reachable *and* at the expected migration revision) — see
-  [`docs/runbook.md`](docs/runbook.md).
+One FastAPI process serves both the API and the built frontend (a static
+mount + catch-all route) — no separate frontend server. There is no
+message queue, cache layer, or service mesh; every application instance is
+stateless, since sessions, rate limits, and realtime fan-out all live in
+PostgreSQL rather than process memory.
 
-There is no message queue, cache layer, or service mesh — one FastAPI
-process, one database, one object store, until real load actually demands
-otherwise. See [`docs/architecture.md`](docs/architecture.md) for the full
-design rationale.
+**A note on naming** (this trips up anyone reading the schema cold): the
+ORM class `Match` is the **event** entity (a scheduled cricket meetup
+players register for) — it was named before teams/fixtures existed. The
+ORM class `Fixture` is what the product UI calls a "match": an actual
+scheduled game between two teams within an event. See the docstrings on
+both classes in [`backend/app/models.py`](backend/app/models.py).
 
-## 6. Technology stack
+Full design rationale: [`docs/architecture.md`](docs/architecture.md).
 
-| Layer | Technology | Version (as pinned in this repo) |
-|---|---|---|
-| Backend | Python | 3.12 (`Dockerfile`, CI) |
-| Backend framework | FastAPI | `>=0.115,<1.0` (`requirements.txt`); `0.141.1` resolved (`requirements.lock.txt`) |
-| ORM / migrations | SQLAlchemy 2.0 / Alembic | `alembic==1.19.2` |
-| Database driver | psycopg 3 | `>=3.1,<4.0` |
-| Object storage client | boto3 | `>=1.34,<2.0` |
-| Frontend | React | `19.2.8` |
-| Frontend build tool | Vite | `8.2.1` |
-| Frontend router | react-router-dom | `7.18.3` |
-| Frontend runtime | Node.js | 22 (`Dockerfile`, CI) |
-| Database (production) | PostgreSQL | 16 (`.github/workflows/ci.yml`, disposable dev containers) |
-| Database (dev/test) | SQLite | via Python's built-in `sqlite3` |
-| Object storage (production) | Any S3-compatible provider (Cloudflare R2 recommended, AWS S3 works identically) | — |
-| Object storage (dev/CI) | MinIO | — |
-| Containerization | Docker (multi-stage: `node:22-alpine` → `python:3.12-slim`) | — |
+## 7. Tech stack
 
-Exact resolved backend dependency versions: `requirements.lock.txt`. Exact
-frontend dependency versions: `package-lock.json`.
+| Layer | Technology |
+|---|---|
+| Frontend | React 19, Vite 8, react-router-dom 7 |
+| Backend | Python 3.12, FastAPI |
+| Database | PostgreSQL 16 (production), SQLite (dev/test) |
+| ORM | SQLAlchemy 2.0 |
+| Migrations | Alembic |
+| Object storage | Any S3-compatible provider (boto3 client) — Cloudflare R2, AWS S3, or MinIO (dev/CI) |
+| Realtime | PostgreSQL `LISTEN`/`NOTIFY` (production), in-process fallback (dev) |
+| Authentication | Argon2 (organizer passwords), phone OTP (players), server-side sessions |
+| Containers | Docker, multi-stage build (`node:22-alpine` → `python:3.12-slim`) |
+| Testing | pytest, httpx |
+| CI/CD | GitHub Actions (SQLite tests, PostgreSQL tests, frontend build, Docker build+healthcheck) |
 
-## 7. Repository structure
+Exact resolved versions: [`requirements.lock.txt`](requirements.lock.txt)
+(backend), [`package-lock.json`](package-lock.json) (frontend).
+
+## 8. Data model
 
 ```
-backend/
-  app/
-    routers/          HTTP endpoints — thin, delegate to services.py
-    models.py          SQLAlchemy models (schema source of truth)
-    schemas.py          Pydantic request/response models
-    services.py          Business logic and state machines
-    services_player.py    Player OTP auth logic
-    config.py             Environment configuration, fail-fast validation
-    database.py            Engine/session creation, migration execution
-    migrate.py               Explicit `python -m backend.app.migrate` entry point
-    deps.py                   FastAPI dependencies (auth, ownership checks)
-    storage.py / storage_s3.py  Object storage protocol + S3 implementation
-    main.py                       FastAPI app assembly, health/readiness
-alembic/
-  versions/            One file per migration, applied in order
-src/                   React frontend (admin/ organizer UI, player/ public UI)
-scripts/               Operational scripts (backup restore test, storage
-                       reconciliation, bucket protection, SQLite→Postgres
-                       migration, DB role provisioning SQL)
-tests/                 pytest suite (SQLite always; PostgreSQL/MinIO/role
-                       tests are environment-variable-gated)
-docs/                  Detailed reference docs — see docs/runbook.md first
-Dockerfile             Multi-stage build: frontend build → Python runtime
-docker-entrypoint.sh   Starts uvicorn, wires reverse-proxy trust
-alembic.ini            Alembic configuration (script location, logging)
-requirements.txt / requirements.lock.txt   Python dependencies (ranges / pinned)
-package.json           Frontend dependencies and npm scripts
-.github/workflows/     CI (tests, build, Docker) and a backup workflow template
+User ──► PlayerProfile
+
+Match (Event)
+  ├──► EventPaymentConfiguration
+  ├──► Registration ──► Payment ──► PaymentProof
+  ├──► Team ──► TeamMember
+  └──► Fixture ──► MatchResult
+                └──► MatchParticipant
 ```
 
-## 8. Prerequisites
+- A `Registration` belongs to one `Match` (event) and one `User`; it owns
+  at most one `Payment`, which owns one or more `PaymentProof` uploads
+  (append-only).
+- A `Team` belongs to one event; its `TeamMember` rows each reference one
+  `Registration` — composite foreign keys guarantee both belong to the
+  same event.
+- A `Fixture` references two `Team`s from the same event. A
+  `MatchParticipant` row records that a specific `Registration` actually
+  played a specific `Fixture` for a specific `Team` — the chained
+  composite foreign keys make it structurally impossible to record a
+  participant against a team they were never assigned to.
+- `MatchResult` is a single row per `Fixture`, with optional award fields
+  (MVP / Best Batter / Best Bowler) that can only reference a real
+  `MatchParticipant` of that same fixture.
 
-| Tool | Required for | Verify with |
-|---|---|---|
-| Git | Everything | `git --version` |
-| Docker (with Compose v2, i.e. Docker Desktop or an equivalent) | **The primary local workflow** — starts the app, PostgreSQL, and MinIO together | `docker --version`, `docker compose version` |
-| Python 3.12 | Only for native (non-Docker) backend development | `python3 --version` |
-| Node.js 22 | Only for native (non-Docker) frontend development | `node --version` |
-| npm | Only for native frontend development | `npm --version` |
-| `psql` (PostgreSQL client) | Optional — inspecting a Postgres database directly | `psql --version` |
+Full schema and invariants: [`docs/database.md`](docs/database.md).
 
-Full detail, exact commands, and what's optional vs. required in each
-environment: **[`docs/runbook.md`](docs/runbook.md)**.
+## 9. Testing
 
-## 9. Quick start
+Latest verified run in this environment:
 
-**The primary, recommended way to run Stranger Club locally is Docker
-Compose — one command starts the app, PostgreSQL, and MinIO (a local
-S3-compatible store) together, pre-migrated and ready.**
+| Suite | Result |
+|---|---|
+| Backend (SQLite) | `168 passed, 14 skipped` |
+| Backend (PostgreSQL + real object storage) | `176 passed, 6 skipped` |
+| Frontend build | `npm run build` — passes |
+| Frontend dependency audit | `npm audit` — 0 vulnerabilities |
+
+```bash
+pytest -q
+```
+runs the full suite against SQLite with no setup. Skipped tests are gated
+on environment variables (`SC_TEST_DATABASE_URL`, `SC_TEST_S3_*`,
+`SC_TEST_APP_ROLE_URL`/`SC_TEST_BACKUP_ROLE_URL`) that point at a real
+PostgreSQL instance, real S3-compatible storage, and least-privilege
+database roles respectively — unset, they skip rather than fail. The
+PostgreSQL-gated portion exercises behavior SQLite can't: row-level
+locking, `LISTEN`/`NOTIFY`, `JSONB` columns, and the composite-foreign-key
+invariants above. Exact variables and setup:
+[`docs/runbook.md`](docs/runbook.md#15-testing).
+
+CI (`.github/workflows/ci.yml`) runs the SQLite suite, the PostgreSQL suite
+against a real `postgres:16-alpine` service container (plus a from-scratch
+migration bootstrap check), the frontend build, and a Docker build +
+`/health` check, on every push/PR to `main`.
+
+## 10. Deployment
+
+The intended production shape:
+
+```
+Docker image ──► compute (e.g. EC2, or any container host)
+                     │
+                     ├──► managed PostgreSQL (e.g. RDS)
+                     └──► S3-compatible object storage (e.g. S3, R2)
+```
+
+The same Dockerfile is used unmodified from local development through to
+production — only the environment variables it's given differ. Production
+requires `SC_ENV=production`, a real PostgreSQL `DATABASE_URL`,
+`SC_STORAGE_BACKEND=s3` with real credentials, and `SC_TRUSTED_PROXY_IPS`
+set to the actual reverse proxy in front of it — the application refuses
+to start otherwise. Migrations run as an explicit release step
+(`python -m backend.app.migrate`), never an application-startup side
+effect once more than one instance is running.
+
+Full environment variable reference, rollback procedure, and reverse-proxy
+trust model: [`docs/deployment.md`](docs/deployment.md). Day-to-day
+operational commands: [`docs/runbook.md`](docs/runbook.md).
+
+No production endpoints, credentials, or infrastructure identifiers are
+included in this repository.
+
+## 11. Local development
+
+The primary, recommended workflow is Docker Compose — one command starts
+the app, PostgreSQL, and MinIO (a local S3-compatible store) together,
+pre-migrated:
 
 ```bash
 git clone https://github.com/Guna-Asher/Stranger-Club.git
@@ -220,34 +321,11 @@ cd Stranger-Club
 docker compose up --build
 ```
 
-Then open:
+Then open `http://localhost:8000`. The first organizer account is created
+automatically: `organizer` / `local-development-only`. To stop:
+`docker compose down`; to also wipe local data: `docker compose down -v`.
 
-```
-http://localhost:8000
-```
-
-That's the whole setup — no Python, Node, or manual database/storage setup
-needed. It builds the same production-style image used for deployment
-(§14), starts PostgreSQL and MinIO, creates the MinIO bucket, runs every
-Alembic migration, and only then starts the application — using
-local-development-only credentials baked into `docker-compose.yml` (see
-[`docs/runbook.md`](docs/runbook.md#2-local-development-docker-compose-primary-workflow)
-for the full explanation, how to stop/reset it, and how to override the
-defaults via a `.env` file if you want to).
-
-The first organizer account is created automatically:
-`organizer` / `local-development-only` (see
-[`docs/runbook.md`](docs/runbook.md#2-local-development-docker-compose-primary-workflow)
-to change it).
-
-To stop everything: `docker compose down`. To wipe local data and start
-fresh: `docker compose down -v` — **destroys the local Postgres/MinIO data
-volumes**, never a production command.
-
-### Advanced: native development (no Docker)
-
-For editing backend/frontend code with hot reload outside a container —
-SQLite and local filesystem storage, zero external services:
+Native (no Docker) alternative, for hot-reload editing:
 
 ```bash
 python3 -m venv .venv
@@ -256,166 +334,77 @@ SC_DATA_DIR=./data SC_ADMIN_PASSWORD='local-dev-password' \
   .venv/bin/uvicorn backend.app.main:app --reload --port 8000
 ```
 
-In a second terminal:
-
 ```bash
 npm install
-npm run dev
+npm run dev   # http://localhost:5173
 ```
 
-| What | URL |
-|---|---|
-| Player app (native dev server) | `http://localhost:5173/` |
-| Organizer login (native dev server) | `http://localhost:5173/admin/login` |
-| Backend directly | `http://localhost:8000/` |
+Full setup detail, environment variables, and an end-to-end product
+walkthrough: [`docs/runbook.md`](docs/runbook.md).
 
-Full detail on both workflows, plus the complete end-to-end product
-walkthrough (register a player, pay, verify, build teams, schedule and
-complete a match, record a result): **[`docs/runbook.md`](docs/runbook.md)**.
-
-## 10. Environment configuration
-
-All configuration is environment variables, validated at startup by
-`backend/app/config.py` — an invalid or missing required variable fails
-fast with a specific error message rather than silently falling back to an
-insecure default. The full variable-by-variable table (required vs.
-optional, development vs. production, safe local defaults) is in
-**[`docs/runbook.md`](docs/runbook.md#6-environment-variables)**.
-
-## 11. Database
-
-PostgreSQL is production-authoritative; SQLite is development/test-only and
-must never back a staging or production deployment (`config.py` refuses to
-start otherwise). Alembic is the sole schema authority from its baseline
-forward. See [`docs/database.md`](docs/database.md) for the full design
-(connection pooling, least-privilege roles, row-locking strategy, schema
-invariants) and [`docs/runbook.md`](docs/runbook.md) for exact setup and
-migration commands.
-
-## 12. Object storage
-
-Payment-proof screenshots and organizer-uploaded QR images are stored
-through a provider-agnostic `Storage` protocol: `LocalFilesystemStorage`
-for development, any S3-compatible provider (Cloudflare R2 recommended, AWS
-S3 or MinIO also work) in production via `S3Storage`. The interface has no
-delete method — evidence is append-only. See
-[`docs/storage.md`](docs/storage.md) for the full model and
-[`docs/runbook.md`](docs/runbook.md) for running MinIO locally.
-
-## 13. Running backend/frontend
-
-The primary path is `docker compose up --build` (§9) — one command, no
-separate terminals. The native/advanced path runs two independent
-processes, always: the backend (`uvicorn`) and the frontend dev server
-(`vite`), each in its own terminal — see §9's advanced section and
-[`docs/runbook.md`](docs/runbook.md#11-starting-the-application).
-
-## 14. Docker
-
-`docker-compose.yml` (repository root) is the **local-only** development
-stack — `docker compose up --build` (§9) starts the app, PostgreSQL 16,
-and MinIO together, with automatic bucket creation and migrations before
-the app starts. It has no bearing on production.
-
-The underlying image is built the same way either locally or for
-deployment:
-
-```bash
-docker build -t stranger-club .
-```
-
-A multi-stage build (Node build stage → Python 3.12-slim runtime, non-root
-user, `HEALTHCHECK` against `/ready` — not `/health`, so an unreachable or
-un-migrated database is reported unhealthy) — the **same image**, unmodified,
-that Compose builds locally is what gets deployed to a platform such as
-Render as a Docker Web Service, pointed at real managed PostgreSQL and
-real S3-compatible storage instead of the local containers. Full sequence,
-environment variables, and read-only-filesystem verification:
-[`docs/runbook.md`](docs/runbook.md#15-docker).
-
-## 15. Testing
-
-```bash
-pytest -q
-```
-
-runs the full suite against SQLite (no setup required). PostgreSQL-specific
-behavior (row locking, `LISTEN`/`NOTIFY`, `JSONB`, composite foreign keys,
-least-privilege roles) and S3-specific behavior only run when the
-corresponding environment variables are set, and are otherwise skipped —
-see [`docs/runbook.md`](docs/runbook.md#14-testing) for the exact variables
-and how to run the PostgreSQL/MinIO suite locally. Frontend:
-`npm run build` and `npm audit`.
-
-## 16. Production deployment overview
+## 12. Project structure
 
 ```
-Trusted reverse proxy / load balancer (TLS termination)
-        │
-1..N stateless application instances
-        │
-Managed PostgreSQL  +  private S3-compatible object storage
+backend/
+  app/
+    routers/            HTTP endpoints — thin, delegate to services.py
+    models.py           SQLAlchemy models (schema source of truth)
+    schemas.py          Pydantic request/response models
+    services.py          Core business logic and state machines
+    services_player.py    Player OTP auth logic
+    config.py               Environment configuration, fail-fast validation
+    database.py               Engine/session creation, migration execution
+    migrate.py                  Explicit `python -m backend.app.migrate` entry point
+    deps.py                      FastAPI dependencies (auth, ownership checks)
+    storage.py / storage_s3.py    Object storage protocol + S3 implementation
+    otp/                            OTP provider protocol + console (dev) implementation
+    main.py                           FastAPI app assembly, health/readiness
+alembic/versions/     One migration file per revision, applied in order
+src/                  React frontend — admin/ (organizer UI), player/ (public UI),
+                      components/, lib/
+tests/                pytest suite — SQLite always; PostgreSQL/S3/role tests
+                      are environment-variable-gated
+scripts/              Operational scripts: role provisioning, bucket
+                      protection, storage reconciliation, restore testing
+docs/                 Architecture, database, storage, deployment, runbook,
+                      backups, disaster recovery, observability
+Dockerfile            Multi-stage build: frontend build → Python runtime
+docker-entrypoint.sh  Starts uvicorn, wires reverse-proxy trust
 ```
 
-Every instance is interchangeable and stateless — sessions, rate limits,
-and realtime fan-out all live in PostgreSQL, not process memory. `SC_ENV`
-gates fail-fast configuration checks (PostgreSQL required, S3 storage
-required, trusted proxy IPs required in `production`). Migrations are an
-explicit release step (`python -m backend.app.migrate`), never an
-application-startup side effect once more than one instance is running.
-Full deployment order, required environment variables, and least-privilege
-database roles: [`docs/runbook.md`](docs/runbook.md#16-production-configuration).
+## 13. Security
 
-## 17. Backups/recovery overview
+- All secrets (database credentials, storage keys, admin bootstrap
+  password) are supplied through environment configuration — never
+  committed to source, and `backend/app/config.py` fails startup if a
+  required one is missing.
+- Payment-proof and QR object storage is private: no public URLs, every
+  read authorized per-request through a short-lived presigned URL.
+- Session tokens and OTP codes are stored as hashes, never in plaintext.
+- Authorization is enforced server-side on every request; ownership
+  mismatches return `404`, not `403`.
+- Critical invariants (capacity, one-active-registration,
+  one-pending-proof, cross-event integrity) are enforced by database
+  constraints, not application logic alone.
 
-Two independent mechanisms: a managed PostgreSQL provider's point-in-time
-recovery, and an independent `pg_dump` archive workflow
-(`.github/workflows/backup.yml` — a **reviewed, tested template that is not
-yet active**; see [`docs/backups.md`](docs/backups.md) for exactly what
-that means). Restore correctness is verified by
-`scripts/restore_test.py`, not assumed. Full procedures:
-[`docs/runbook.md`](docs/runbook.md#18-backups) and
-[`docs/disaster-recovery.md`](docs/disaster-recovery.md).
+This repository does not currently define a formal responsible-disclosure
+contact or security policy file. If you find a genuine vulnerability,
+please raise it through a private channel on the repository (e.g. a
+GitHub private security advisory) rather than a public issue.
 
-## 18. Security model
+## 14. Roadmap
 
-- Argon2 password hashing (organizer), OTP-over-phone (player) — never a
-  shared credential store
-- `HttpOnly`, `Secure` (outside local dev) session cookies for both
-  identities, separate CSRF tokens per identity
-- Every ownership check returns `404` (never `403`) on a mismatch, so a
-  non-owner cannot even confirm a resource exists
-- Distributed, fail-closed rate limiting on login, OTP request/verify, and
-  payment-related endpoints
-- Payment-proof storage credential has no delete permission; every read is
-  authorized per-request through a short-lived presigned URL
-- Reverse-proxy trust is explicit and opt-in (`SC_TRUSTED_PROXY_IPS`) —
-  without it, forwarded headers are never trusted
-- Full checklist before any production deployment:
-  [`docs/runbook.md`](docs/runbook.md#24-security-checklist)
+- Integrate a real SMS/OTP delivery provider (the current
+  `ConsoleOtpProvider` is a development-only stand-in behind a swappable
+  `OtpProvider` interface — see [`backend/app/otp/base.py`](backend/app/otp/base.py))
+- Configure a permanent public domain and HTTPS for the deployed instance
+- Automate production database backups (a reviewed `pg_dump` GitHub
+  Actions template exists at
+  [`.github/workflows/backup.yml`](.github/workflows/backup.yml) but is
+  not yet active — see [`docs/backups.md`](docs/backups.md))
 
-## 19. Operational documentation
+## 15. License
 
-| Document | Covers |
-|---|---|
-| [`docs/runbook.md`](docs/runbook.md) | **Start here for anything operational** — setup, testing, Docker, migrations, production configuration, backups/restore, troubleshooting |
-| [`docs/architecture.md`](docs/architecture.md) | System design and the reasoning behind it |
-| [`docs/database.md`](docs/database.md) | Connection pooling, roles, migrations, row locking, schema invariants |
-| [`docs/storage.md`](docs/storage.md) | Object storage model, namespaces, payment-proof immutability |
-| [`docs/backups.md`](docs/backups.md) | Backup mechanisms, RPO/RTO |
-| [`docs/disaster-recovery.md`](docs/disaster-recovery.md) | Scenario-by-scenario incident response |
-| [`docs/observability.md`](docs/observability.md) | What is logged, what is deliberately never logged |
-| [`docs/deployment.md`](docs/deployment.md) | Environment variable reference, rollback |
-
-## 20. Project status
-
-Current implemented product boundary:
-
-```
-Registration → Payment → Confirmation → Teams → Matches → Results / MVP / Participation
-```
-
-Everything listed in [§4](#4-what-is-intentionally-not-included) is a
-later, separate phase and does not exist in this codebase yet. Do not
-assume a capability exists because it is a natural next step — check
-[§3](#3-current-capabilities) and [§4](#4-what-is-intentionally-not-included) above.
+No license file is currently present in this repository. All rights are
+reserved by default until a license is added — do not assume permission to
+reuse this code.
