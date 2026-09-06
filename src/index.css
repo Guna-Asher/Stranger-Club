@@ -39,8 +39,26 @@ h1, h2, h3, p { margin: 0; }
 .date-lock span { border-left: 1px solid #ffffff55; color: #d8ddd8; font: 10px/1.25 'DM Mono'; letter-spacing: .08em; padding-left: 10px; text-transform: uppercase; }
 .hero-copy > p:last-child { align-items: center; color: #d8ddd8; display: flex; font-size: 13px; font-weight: 600; gap: 7px; margin-top: 17px; }
 .match-hero.landing-hero { min-height: 300px; }
-.landing-copy h1 { font-size: clamp(30px, 8vw, 46px); line-height: 1.05; margin: 10px 0 22px; max-width: 260px; }
-.landing-copy .primary-button { margin-top: 8px; }
+.landing-copy { padding-bottom: 46px; }
+.landing-copy h1 { font-size: clamp(32px, 9vw, 52px); letter-spacing: -.03em; line-height: 1.06; margin: 0 0 20px; max-width: 480px; text-transform: none; }
+.landing-copy .sub { color: #b9c0ba; font-size: 15px; line-height: 1.6; margin: 0 0 20px; max-width: 420px; }
+.hero-meta { align-items: center; color: #7c847d; display: flex; font-size: 13.5px; font-weight: 600; gap: 9px; margin-bottom: 28px; }
+.hero-meta svg { flex: none; }
+.meta-dot { color: #4b524d; font-size: 16px; line-height: 0; }
+.landing-copy .primary-button { border-radius: 100px; box-shadow: 0 10px 34px -10px #d4ff3670; font-size: 15px; margin-top: 8px; max-width: 480px; min-height: 60px; width: 100%; }
+.continue-divider { align-items: center; color: #757d78; display: flex; font: 10px 'DM Mono'; gap: 14px; letter-spacing: .12em; margin: 28px 0 4px; max-width: 480px; }
+.continue-divider:before, .continue-divider:after { background: #232b24; content: ''; flex: 1; height: 1px; }
+.continue-cards { display: flex; flex-direction: column; gap: 12px; margin: 18px 0 22px; max-width: 480px; }
+.continue-card { align-items: center; background: #161c17; border: 1px solid #232b24; border-radius: 16px; display: flex; gap: 14px; padding: 16px 18px; transition: border-color .15s, transform .15s; }
+.continue-card:hover { border-color: #3a4a3d; transform: translateY(-1px); }
+.continue-card .icon { align-items: center; background: #1f2a20; border-radius: 12px; color: #d4ff36; display: flex; flex: none; height: 44px; justify-content: center; width: 44px; }
+.continue-card .info { display: flex; flex: 1; flex-direction: column; gap: 3px; }
+.continue-card .info b { color: white; font-size: 14.5px; }
+.continue-card .info span { color: #8b948d; font-size: 12px; }
+.continue-card .arrow { color: #6b7a6e; flex: none; }
+.signup-line { color: #7c847d; font-size: 13px; max-width: 480px; }
+.signup-line a { color: #f2f4f1; font-weight: 800; margin-left: 5px; }
+.signup-line a:hover { color: #d4ff36; }
 .field-graphic { bottom: -1px; height: 222px; pointer-events: none; position: absolute; right: -43px; width: 230px; }
 .field-graphic > div { border: 2px solid #d4ff36; border-radius: 50%; height: 230px; opacity: .8; position: relative; width: 230px; }
 .field-graphic > div:before, .field-graphic > div:after { background: #d4ff36; content: ''; height: 2px; left: 0; position: absolute; top: 50%; width: 100%; }
