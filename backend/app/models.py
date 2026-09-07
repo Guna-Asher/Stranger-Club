@@ -609,13 +609,42 @@ class RateLimitBucket(Base):
 
 
 class User(Base):
-    """Authenticated player identity. Kept separate from profile data (PlayerProfile)."""
+    """Authenticated player identity. Kept separate from profile data (PlayerProfile).
+
+    Two independent identity paths share this one table: the still-intact OTP
+    architecture (phone-based — see OtpChallenge) and the current
+    email+password onboarding path (see services_player.create_player_account
+    / authenticate_player). `phone` is nullable specifically so an
+    email+password signup never has to fabricate or verify one — the raw,
+    editable, unverified phone number a player gives at signup instead lives
+    on PlayerProfile.phone. `email` is this path's login identifier;
+    uniqueness is case-insensitive and enforced by the database itself via
+    the functional index below, not only by normalizing before writes.
+    """
     __tablename__ = "users"
+    __table_args__ = (
+        # Case-insensitive email uniqueness, portable to both PostgreSQL and
+        # SQLite (3.9+ supports expression + partial indexes). Application
+        # code always normalizes email to lowercase before writing (see
+        # schemas.normalize_email), so this index is a database-level
+        # backstop against that invariant ever being bypassed, not the only
+        # thing keeping two players from sharing a login identity.
+        Index(
+            "uq_users_email_lower", text("lower(email)"), unique=True,
+            sqlite_where=text("email IS NOT NULL"),
+            postgresql_where=text("email IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    phone: Mapped[str] = mapped_column(String(16), unique=True, index=True)
+    phone: Mapped[str | None] = mapped_column(String(16), unique=True, index=True, nullable=True)
     phone_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     email: Mapped[str | None] = mapped_column(String(254), nullable=True)
+    # Argon2 hash (deps.PASSWORD_HASHER — the same instance/convention the
+    # organizer login already uses). NULL for any account that has never set
+    # a password: every pre-existing OTP-only account, until it completes a
+    # password-setup path later (see docs/architecture.md's player-auth note).
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_ist, onupdate=now_ist)
@@ -631,6 +660,12 @@ class PlayerProfile(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
     display_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # The player's raw, editable, unverified phone number — profile
+    # information only, deliberately separate from the OTP-verified identity
+    # that would live on User.phone. Collected at email+password signup;
+    # editable from Edit Profile with no OTP required. See User's docstring
+    # for why this split exists.
+    phone: Mapped[str | None] = mapped_column(String(16), nullable=True)
     cricket_role: Mapped[str] = mapped_column(String(32), default="NO_PREFERENCE")
     skill_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
     photo_storage_key: Mapped[str | None] = mapped_column(String(255), nullable=True)

@@ -36,7 +36,7 @@ logger = logging.getLogger("stranger_club")
 # that partially failed) fails readiness instead of serving traffic against
 # an unexpected schema. SQLite dev/test databases are stamped to head at
 # every startup (see database.py) so this check only applies to PostgreSQL.
-ALEMBIC_EXPECTED_HEAD = "0010"
+ALEMBIC_EXPECTED_HEAD = "0011"
 
 
 def _resolve_database_url(config: AppConfig, data_dir: Path | None, database_url: str | None) -> str:

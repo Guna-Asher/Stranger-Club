@@ -32,6 +32,19 @@ def normalize_phone(value: str) -> str:
     return cleaned
 
 
+def normalize_email(value: str) -> str:
+    """The canonical form every stored/compared player email is put into —
+    matches the case-insensitive uniqueness enforced at the database level
+    (see models.User's uq_users_email_lower)."""
+    return value.strip().lower()
+
+
+# No password policy existed anywhere in this application before player
+# email+password auth (organizer login only ever checks a hash, never a
+# policy) — this is a new baseline, not a pre-existing one.
+PLAYER_PASSWORD_MIN_LENGTH = 8
+
+
 class MatchCreate(BaseModel):
     name: str = Field(min_length=3, max_length=120)
     date: date_type
@@ -166,8 +179,59 @@ class OtpVerify(BaseModel):
 
 
 class PlayerAuthResponse(BaseModel):
-    phone: str
+    # Exactly one identity path populates each of these for a given account
+    # today (OTP -> phone, email+password -> email), but both are optional
+    # here so this one response shape can keep serving both intact paths —
+    # see models.User's docstring.
+    email: str | None = None
+    phone: str | None = None
     csrf_token: str
+
+
+class PlayerSignupRequest(BaseModel):
+    """First-time player account creation: email + password, collected
+    alongside name/phone/avatar. Does not touch OTP in any way — see
+    services_player.create_player_account."""
+    name: str = Field(min_length=2, max_length=120)
+    email: EmailStr
+    phone: str = Field(min_length=10, max_length=16)
+    password: str = Field(min_length=PLAYER_PASSWORD_MIN_LENGTH, max_length=256)
+    confirm_password: str = Field(min_length=1, max_length=256)
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if not value:
+            raise ValueError("Name is required")
+        return value
+
+    @field_validator("email", mode="after")
+    @classmethod
+    def normalize_email_value(cls, value: str) -> str:
+        return normalize_email(value)
+
+    @field_validator("phone")
+    @classmethod
+    def valid_phone(cls, value: str) -> str:
+        return normalize_phone(value)
+
+    @field_validator("confirm_password")
+    @classmethod
+    def passwords_match(cls, value: str, info) -> str:
+        if "password" in info.data and value != info.data["password"]:
+            raise ValueError("Passwords do not match")
+        return value
+
+
+class PlayerLoginRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=1, max_length=256)
+
+    @field_validator("email", mode="after")
+    @classmethod
+    def normalize_email_value(cls, value: str) -> str:
+        return normalize_email(value)
 
 
 class PlayerProfileUpdate(BaseModel):
@@ -175,22 +239,42 @@ class PlayerProfileUpdate(BaseModel):
     cricket_role: Position | None = None
     skill_rating: int | None = Field(default=None, ge=1, le=10)
     bio: str | None = Field(default=None, max_length=500)
+    email: EmailStr | None = None
+    # Profile-only, unverified — editing it never touches OTP state. See
+    # models.PlayerProfile.phone's docstring.
+    phone: str | None = None
 
-    @field_validator("display_name", "bio", mode="before")
+    @field_validator("display_name", "bio", "phone", "email", mode="before")
     @classmethod
     def blank_is_none(cls, value):
         if isinstance(value, str) and not value.strip():
             return None
         return value
 
+    @field_validator("email", mode="after")
+    @classmethod
+    def normalize_email_value(cls, value: str | None) -> str | None:
+        return normalize_email(value) if value else value
+
+    @field_validator("phone")
+    @classmethod
+    def valid_phone(cls, value: str | None) -> str | None:
+        return normalize_phone(value) if value else value
+
 
 class PlayerProfileResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
     display_name: str | None = None
     cricket_role: str = "NO_PREFERENCE"
     skill_rating: int | None = None
     bio: str | None = None
     avatar_design_id: int | None = None
+    # Identity fields, merged in from User by the router (they don't live on
+    # the PlayerProfile row itself) — see routers/player_auth.py's
+    # _profile_response. email is the account's login identifier; phone is
+    # profile-only and unverified (never a "Verified"/"Phone Verified" badge
+    # — see PlayerProfile.phone's docstring).
+    email: str | None = None
+    phone: str | None = None
 
 
 class AvatarChoose(BaseModel):

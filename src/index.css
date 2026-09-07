@@ -59,6 +59,11 @@ h1, h2, h3, p { margin: 0; }
 .signup-line { color: #7c847d; font-size: 13px; max-width: 480px; }
 .signup-line a { color: #f2f4f1; font-weight: 800; margin-left: 5px; }
 .signup-line a:hover { color: #d4ff36; }
+/* .flow pages sit on the light body background, not the dark landing hero
+   .signup-line above was designed for — override to a readable dark link. */
+.flow .signup-line { color: #6e756f; margin: 4px 0 18px; }
+.flow .signup-line a { color: #101411; text-decoration: underline; text-underline-offset: 2px; }
+.flow .signup-line a:hover { color: #5c8200; }
 .field-graphic { bottom: -1px; height: 222px; pointer-events: none; position: absolute; right: -43px; width: 230px; }
 .field-graphic > div { border: 2px solid #d4ff36; border-radius: 50%; height: 230px; opacity: .8; position: relative; width: 230px; }
 .field-graphic > div:before, .field-graphic > div:after { background: #d4ff36; content: ''; height: 2px; left: 0; position: absolute; top: 50%; width: 100%; }

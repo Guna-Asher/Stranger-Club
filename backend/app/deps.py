@@ -39,6 +39,13 @@ OTP_VERIFY_IP_LIMIT = 20
 OTP_VERIFY_IP_WINDOW_SECONDS = 3600
 AVATAR_CHANGE_LIMIT = 20
 AVATAR_CHANGE_WINDOW_SECONDS = 3600
+# Email + password: the current player onboarding/login path (additive to
+# the OTP limiters above, which stay in place for the still-intact OTP
+# architecture).
+PLAYER_SIGNUP_IP_LIMIT = 10
+PLAYER_SIGNUP_IP_WINDOW_SECONDS = 3600
+PLAYER_LOGIN_FAILURE_LIMIT = 8
+PLAYER_LOGIN_FAILURE_WINDOW_SECONDS = 900
 
 
 class EventBroadcaster:

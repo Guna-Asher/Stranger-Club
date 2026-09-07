@@ -3,11 +3,11 @@ import { ChevronRight, LoaderCircle, ShieldCheck } from 'lucide-react';
 import Field from '../components/Field';
 import FlowHeader from '../components/FlowHeader';
 import FormError from '../components/FormError';
-import PhoneVerify from './PhoneVerify';
+import PlayerAuth from './PlayerAuth';
 import { api } from '../lib/api';
 
 export default function Register({ match, back, done, verified, onVerified }) {
-  if (!verified) return <PhoneVerify back={back} onVerified={onVerified} />;
+  if (!verified) return <PlayerAuth back={back} onAuthenticated={onVerified} />;
   return <RegisterDetails match={match} back={back} done={done} />;
 }
 

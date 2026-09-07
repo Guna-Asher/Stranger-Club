@@ -10,7 +10,7 @@ import ErrorPage from '../components/ErrorPage';
 import Status from '../components/Status';
 import Toast from '../components/Toast';
 import AvatarPicker from './AvatarPicker';
-import PhoneVerify from './PhoneVerify';
+import PlayerAuth from './PlayerAuth';
 import { api, setCsrfToken } from '../lib/api';
 import { dateText, timeText } from '../lib/format';
 
@@ -63,13 +63,13 @@ export default function Profile() {
         api('/player/profile', { authScope: 'player' }), api('/player/matches', { authScope: 'player' }),
       ]);
       setProfile(p); setDashboard(m);
-      setForm({ display_name: p.display_name || '', cricket_role: p.cricket_role, bio: p.bio || '' });
+      setForm({ display_name: p.display_name || '', cricket_role: p.cricket_role, bio: p.bio || '', email: p.email || '', phone: p.phone || '' });
     } catch (err) { setError(err.message); }
   };
   useEffect(() => { if (verified) load(); }, [verified]);
 
   if (!checked) return <Loading />;
-  if (!verified) return <PhoneVerify back={() => navigate('/')} onVerified={() => setVerified(true)} />;
+  if (!verified) return <PlayerAuth back={() => navigate('/')} onAuthenticated={() => setVerified(true)} />;
   if (error) return <ErrorPage message={error} />;
   if (!profile || !dashboard) return <Loading />;
 
@@ -84,7 +84,7 @@ export default function Profile() {
   };
 
   const cancelEdit = () => {
-    setForm({ display_name: profile.display_name || '', cricket_role: profile.cricket_role, bio: profile.bio || '' });
+    setForm({ display_name: profile.display_name || '', cricket_role: profile.cricket_role, bio: profile.bio || '', email: profile.email || '', phone: profile.phone || '' });
     setFormError(''); setEditing(false);
   };
 
@@ -113,20 +113,21 @@ export default function Profile() {
       <Avatar designId={profile.avatar_design_id} name={profile.display_name} size={64} />
       <div><b>{profile.display_name || 'No name set yet'}</b><span>{ROLE_LABEL[profile.cricket_role] || profile.cricket_role}</span></div>
     </div>
-    {profile.avatar_design_id == null ? (
-      <div className="form-actions">
-        <button className="primary-button" disabled={avatarBusy} onClick={generateAvatar}>
-          {avatarBusy ? <LoaderCircle className="spin" /> : <><Shuffle size={16} /> GENERATE NEW</>}
-        </button>
-        <button className="ghost-button" onClick={() => setAvatarSheetOpen(true)}>CHOOSE AVATAR</button>
-      </div>
-    ) : (
-      <button className="ghost-button" onClick={() => setAvatarSheetOpen(true)}><RefreshCw size={15} /> CHANGE AVATAR</button>
-    )}
+    {!editing && <div className="quiet"><div>{profile.email || 'No email set'}</div><div>{profile.phone || 'No phone set'}</div></div>}
 
     {editing && (
       <form className="form" onSubmit={save}>
-        <Field label="DISPLAY NAME" placeholder="Your name" value={form.display_name} set={(v) => setForm({ ...form, display_name: v })} />
+        <label className="field"><span>AVATAR</span>
+          <div className="form-actions">
+            <button type="button" className="ghost-button" disabled={avatarBusy} onClick={generateAvatar}>
+              {avatarBusy ? <LoaderCircle className="spin" /> : <><Shuffle size={16} /> GENERATE NEW</>}
+            </button>
+            <button type="button" className="ghost-button" onClick={() => setAvatarSheetOpen(true)}><RefreshCw size={15} /> CHOOSE AVATAR</button>
+          </div>
+        </label>
+        <Field label="NAME" placeholder="Your name" value={form.display_name} set={(v) => setForm({ ...form, display_name: v })} />
+        <Field label="EMAIL" placeholder="you@example.com" type="email" value={form.email} set={(v) => setForm({ ...form, email: v })} />
+        <Field label="PHONE NUMBER" placeholder="10-digit number" type="tel" inputMode="numeric" value={form.phone} set={(v) => setForm({ ...form, phone: v })} />
         <label className="field"><span>CRICKET ROLE</span>
           <select value={form.cricket_role} onChange={(e) => setForm({ ...form, cricket_role: e.target.value })}>
             {Object.entries(ROLE_LABEL).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
@@ -135,7 +136,7 @@ export default function Profile() {
         <label className="field"><span>BIO · OPTIONAL</span><textarea value={form.bio} maxLength={500} onChange={(e) => setForm({ ...form, bio: e.target.value })} /></label>
         <FormError>{formError}</FormError>
         <div className="form-actions">
-          <button className="primary-button" disabled={busy}>{busy ? <LoaderCircle className="spin" /> : 'SAVE PROFILE'}</button>
+          <button className="primary-button" disabled={busy}>{busy ? <LoaderCircle className="spin" /> : 'SAVE CHANGES'}</button>
           <button type="button" className="ghost-button" disabled={busy} onClick={cancelEdit}>CANCEL</button>
         </div>
       </form>

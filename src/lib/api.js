@@ -6,7 +6,7 @@ export const setCsrfToken = (token, scope = 'organizer') => {
   else organizerCsrfToken = token;
 };
 
-const NO_CSRF_PATHS = new Set(['/auth/login', '/player/otp/request', '/player/otp/verify']);
+const NO_CSRF_PATHS = new Set(['/auth/login', '/player/otp/request', '/player/otp/verify', '/player/signup', '/player/login']);
 
 export const api = async (path, options = {}) => {
   const { authScope = 'organizer', ...fetchOptions } = options;

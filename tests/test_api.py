@@ -78,6 +78,24 @@ def player_login(client: TestClient, phone: str = "9876543210") -> dict[str, str
     return {"X-CSRF-Token": verified.json()["csrf_token"]}
 
 
+PLAYER_SIGNUP_DEFAULTS = {"name": "Test Player", "email": "player@example.com", "phone": "9876500000", "password": "correct-horse-battery"}
+
+
+def player_signup(client: TestClient, **overrides):
+    payload = {**PLAYER_SIGNUP_DEFAULTS, **overrides}
+    payload.setdefault("confirm_password", payload["password"])
+    return client.post("/api/player/signup", json=payload)
+
+
+def player_email_login(client: TestClient, email: str = PLAYER_SIGNUP_DEFAULTS["email"], password: str = PLAYER_SIGNUP_DEFAULTS["password"], **signup_overrides) -> dict[str, str]:
+    """Creates a fresh email+password account (unless one with this email
+    already exists in this test's database) and returns its CSRF header —
+    the email+password equivalent of player_login() above."""
+    signup = player_signup(client, email=email, password=password, **signup_overrides)
+    assert signup.status_code == 200, signup.json()
+    return {"X-CSRF-Token": signup.json()["csrf_token"]}
+
+
 def create_second_organizer(client: TestClient, username: str = "second_organizer", password: str = "correct-horse-2") -> dict[str, str]:
     from argon2 import PasswordHasher
     from backend.app.models import Organizer
@@ -133,7 +151,7 @@ def test_health_public_event_and_migration(client: TestClient):
             assert {"20260818_domain_foundation", "20260818_payment_state_cleanup", "20260906_player_identity"}.issubset(versions)
         else:
             current_head = session.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            assert current_head == "0010"
+            assert current_head == "0011"
 
 
 def test_legacy_database_is_upgraded_without_losing_event_or_payment(tmp_path: Path):
@@ -541,6 +559,198 @@ def test_player_session_rotates_on_reverification(client: TestClient):
     assert old_cookie != new_cookie
     with client.app.state.session_factory() as session:
         assert session.query(PlayerSession).count() == 1
+
+
+# --- Player email + password authentication (current onboarding/login path) --
+# The OTP tests above continue to exercise the untouched OTP architecture —
+# these exercise the new, additive email+password path that has replaced it
+# on the actual player signup/login UI.
+
+def test_player_signup_creates_account_and_session(client: TestClient):
+    from backend.app.models import User
+    response = player_signup(client, email="newplayer@example.com", phone="9876500001")
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["email"] == "newplayer@example.com"
+    assert "csrf_token" in body
+    assert "sc_player_session" in client.cookies
+
+    me = client.get("/api/player/me")
+    assert me.status_code == 200 and me.json()["email"] == "newplayer@example.com"
+
+    with client.app.state.session_factory() as session:
+        user = session.query(User).filter_by(email="newplayer@example.com").one()
+        assert user.password_hash is not None
+        assert user.phone is None  # never fabricated — see PlayerProfile.phone instead
+        assert user.phone_verified_at is None
+
+
+def test_player_signup_password_is_hashed_never_stored_plaintext(client: TestClient):
+    from backend.app.models import User
+    password = "correct-horse-battery"
+    player_signup(client, email="hashcheck@example.com", phone="9876500002", password=password)
+    with client.app.state.session_factory() as session:
+        user = session.query(User).filter_by(email="hashcheck@example.com").one()
+        assert user.password_hash != password
+        assert password not in user.password_hash
+        assert user.password_hash.startswith("$argon2")
+
+
+def test_player_signup_duplicate_email_rejected(client: TestClient):
+    player_signup(client, email="dupe@example.com", phone="9876500003")
+    second = player_signup(client, email="dupe@example.com", phone="9876500004")
+    assert second.status_code == 409
+    assert second.json()["error"]["code"] == "EMAIL_TAKEN"
+
+
+def test_player_signup_case_insensitive_duplicate_email_rejected(client: TestClient):
+    player_signup(client, email="CaseTest@Example.com", phone="9876500005")
+    second = player_signup(client, email="casetest@example.com", phone="9876500006")
+    assert second.status_code == 409
+    assert second.json()["error"]["code"] == "EMAIL_TAKEN"
+
+
+def test_player_signup_rejects_mismatched_confirm_password(client: TestClient):
+    response = client.post("/api/player/signup", json={
+        "name": "Test Player", "email": "mismatch@example.com", "phone": "9876500007",
+        "password": "correct-horse-battery", "confirm_password": "different-password",
+    })
+    assert response.status_code == 422
+
+
+def test_player_signup_rejects_short_password(client: TestClient):
+    response = client.post("/api/player/signup", json={
+        "name": "Test Player", "email": "shortpw@example.com", "phone": "9876500008",
+        "password": "short", "confirm_password": "short",
+    })
+    assert response.status_code == 422
+
+
+def test_player_signup_assigns_avatar(client: TestClient):
+    response = player_signup(client, email="avatartest@example.com", phone="9876500009")
+    assert response.status_code == 200
+    profile = client.get("/api/player/profile", headers={"X-CSRF-Token": response.json()["csrf_token"]})
+    assert profile.json()["avatar_design_id"] is not None
+
+
+def test_player_signup_saves_phone_on_profile(client: TestClient):
+    headers = player_email_login(client, email="phonecheck@example.com", phone="9876500010")
+    profile = client.get("/api/player/profile", headers=headers)
+    assert profile.status_code == 200
+    assert profile.json()["phone"] == "9876500010"
+
+
+def test_player_email_login_happy_path(client: TestClient):
+    player_signup(client, email="logintest@example.com", phone="9876500011", password="correct-horse-battery")
+    client.post("/api/player/logout", headers={"X-CSRF-Token": client.get("/api/player/me").json()["csrf_token"]})
+    login_response = client.post("/api/player/login", json={"email": "logintest@example.com", "password": "correct-horse-battery"})
+    assert login_response.status_code == 200, login_response.json()
+    assert login_response.json()["email"] == "logintest@example.com"
+    assert "sc_player_session" in client.cookies
+
+
+def test_player_email_login_wrong_password_returns_generic_error(client: TestClient):
+    player_signup(client, email="wrongpw@example.com", phone="9876500012", password="correct-horse-battery")
+    response = client.post("/api/player/login", json={"email": "wrongpw@example.com", "password": "totally-wrong-password"})
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "INVALID_CREDENTIALS"
+
+
+def test_player_email_login_nonexistent_email_returns_same_generic_error(client: TestClient):
+    existing = player_signup(client, email="realaccount@example.com", phone="9876500013", password="correct-horse-battery")
+    assert existing.status_code == 200
+    wrong_password = client.post("/api/player/login", json={"email": "realaccount@example.com", "password": "wrong-password-here"})
+    nonexistent = client.post("/api/player/login", json={"email": "doesnotexist@example.com", "password": "wrong-password-here"})
+    assert wrong_password.status_code == nonexistent.status_code == 401
+    assert wrong_password.json()["error"]["code"] == nonexistent.json()["error"]["code"] == "INVALID_CREDENTIALS"
+
+
+def test_player_email_login_creates_player_session(client: TestClient):
+    player_signup(client, email="sessioncheck@example.com", phone="9876500014", password="correct-horse-battery")
+    client.cookies.clear()
+    login_response = client.post("/api/player/login", json={"email": "sessioncheck@example.com", "password": "correct-horse-battery"})
+    assert login_response.status_code == 200
+    with client.app.state.session_factory() as session:
+        assert session.query(PlayerSession).count() >= 1
+
+
+def test_player_email_logout_works(client: TestClient):
+    headers = player_email_login(client, email="logoutcheck@example.com", phone="9876500015")
+    assert client.get("/api/player/me").status_code == 200
+    assert client.post("/api/player/logout", headers=headers).status_code == 204
+    assert client.get("/api/player/me").status_code == 401
+
+
+def test_player_email_login_rate_limited(client: TestClient):
+    player_signup(client, email="ratelimited@example.com", phone="9876500016", password="correct-horse-battery")
+    from backend.app.deps import PLAYER_LOGIN_FAILURE_LIMIT
+    for _ in range(PLAYER_LOGIN_FAILURE_LIMIT):
+        response = client.post("/api/player/login", json={"email": "ratelimited@example.com", "password": "wrong-password"})
+        assert response.status_code == 401
+    limited = client.post("/api/player/login", json={"email": "ratelimited@example.com", "password": "wrong-password"})
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "RATE_LIMITED"
+
+
+def test_player_cannot_access_another_players_profile_via_email_auth(client: TestClient):
+    a_headers = player_email_login(client, email="playera@example.com", phone="9876500017", name="Player A Original")
+    a_profile = client.patch("/api/player/profile", headers=a_headers, json={"display_name": "Player A"})
+    assert a_profile.status_code == 200 and a_profile.json()["display_name"] == "Player A"
+
+    b_client = TestClient(client.app)
+    b_headers = player_email_login(b_client, email="playerb@example.com", phone="9876500018", name="Player B")
+    b_profile = b_client.get("/api/player/profile", headers=b_headers)
+    # Sees only their own account's data — there is no player_id to request
+    # someone else's profile by, so this is player B's own signup name, never
+    # player A's edited "Player A".
+    assert b_profile.json()["display_name"] == "Player B"
+    assert b_profile.json()["email"] == "playerb@example.com"
+
+
+def test_player_cannot_modify_another_players_profile(client: TestClient):
+    """There is no endpoint that accepts a target player id at all — every
+    profile mutation is scoped to whichever session cookie/CSRF pair made the
+    request, so a second player's own authenticated session can only ever
+    modify its own profile, never player A's, no matter what it sends."""
+    player_email_login(client, email="targeta@example.com", phone="9876500019", name="Player A")
+
+    b_client = TestClient(client.app)
+    b_headers = player_email_login(b_client, email="targetb@example.com", phone="9876500020", name="Player B")
+    b_client.patch("/api/player/profile", headers=b_headers, json={"display_name": "B changed"})
+
+    with client.app.state.session_factory() as session:
+        from backend.app.models import PlayerProfile, User
+        a_user = session.query(User).filter_by(email="targeta@example.com").one()
+        a_profile = session.query(PlayerProfile).filter_by(user_id=a_user.id).one()
+        assert a_profile.display_name == "Player A"  # untouched by B's request
+
+
+def test_edit_profile_can_change_phone(client: TestClient):
+    headers = player_email_login(client, email="phoneedit@example.com", phone="9876500021")
+    updated = client.patch("/api/player/profile", headers=headers, json={"phone": "9876511111"})
+    assert updated.status_code == 200
+    assert updated.json()["phone"] == "9876511111"
+
+
+def test_player_profile_phone_is_never_marked_verified(client: TestClient):
+    """The profile response has no verified/phone_verified/otp_verified field
+    at all for this path — signup and edits never touch users.phone_verified_at."""
+    headers = player_email_login(client, email="unverified@example.com", phone="9876500022")
+    profile = client.get("/api/player/profile", headers=headers).json()
+    assert "verified" not in profile and "phone_verified" not in profile and "otp_verified" not in profile
+
+
+def test_existing_otp_tests_still_pass_alongside_email_password(client: TestClient):
+    """A smoke check that both identity paths coexist cleanly in the same
+    database: an OTP-verified player and an email+password player are
+    entirely independent accounts."""
+    otp_headers = player_login(client, "9812399000")
+    email_headers = player_email_login(client, email="coexist@example.com", phone="9876500023")
+    assert client.get("/api/player/me").status_code == 200
+    with client.app.state.session_factory() as session:
+        from backend.app.models import User
+        assert session.query(User).filter_by(phone="9812399000").one().email is None
+        assert session.query(User).filter_by(email="coexist@example.com").one().phone is None
 
 
 # --- Authorization -----------------------------------------------------------
@@ -1071,10 +1281,16 @@ def test_player_can_view_and_update_own_profile(client: TestClient):
     player_headers = player_login(client, "9877900001")
     profile = client.get("/api/player/profile", headers=player_headers)
     assert profile.status_code == 200
-    assert profile.json() == {"display_name": None, "cricket_role": "NO_PREFERENCE", "skill_rating": None, "bio": None, "avatar_design_id": None}
+    assert profile.json() == {
+        "display_name": None, "cricket_role": "NO_PREFERENCE", "skill_rating": None, "bio": None,
+        "avatar_design_id": None, "email": None, "phone": None,
+    }
     updated = client.patch("/api/player/profile", headers=player_headers, json={"display_name": "Test Player", "cricket_role": "BOWLER", "skill_rating": 7})
     assert updated.status_code == 200
-    assert updated.json() == {"display_name": "Test Player", "cricket_role": "BOWLER", "skill_rating": 7, "bio": None, "avatar_design_id": None}
+    assert updated.json() == {
+        "display_name": "Test Player", "cricket_role": "BOWLER", "skill_rating": 7, "bio": None,
+        "avatar_design_id": None, "email": None, "phone": None,
+    }
 
 
 def test_profile_requires_authentication(client: TestClient):

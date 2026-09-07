@@ -4,12 +4,15 @@ import logging
 import secrets
 from datetime import timedelta
 
-from sqlalchemy import select, text
+from fastapi import HTTPException
+from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .deps import token_hash
+from .deps import PASSWORD_HASHER, token_hash
 from .models import OtpChallenge, PlayerProfile, User, now_ist
-from .services import api_error, begin_serialized_write
+from .schemas import normalize_email
+from .services import api_error, assign_new_avatar, begin_serialized_write
 
 logger = logging.getLogger("stranger_club")
 
@@ -78,3 +81,79 @@ def verify_otp(session: Session, phone: str, code: str) -> User:
     session.refresh(user)
     logger.info("player_verified user_id=%s", user.id)
     return user
+
+
+# ---------------------------------------------------------------------------
+# Email + password: the current player onboarding/login path (this file's
+# OTP functions above are untouched and remain fully functional — they're
+# simply no longer wired into the active signup/login UI; see
+# routers/player_auth.py). A precomputed Argon2 hash, verified against (and
+# always failing) whenever a submitted login email doesn't resolve to an
+# active, password-having account — the exact same timing-side-channel
+# mitigation routers/auth.py already uses for organizer login, reused here
+# rather than reinvented.
+# ---------------------------------------------------------------------------
+
+_DUMMY_PLAYER_PASSWORD_HASH = PASSWORD_HASHER.hash(secrets.token_urlsafe(32))
+
+
+def create_player_account(session: Session, *, name: str, email: str, phone: str, password: str) -> User:
+    """First-time player account creation. Never touches OTP: users.phone is
+    left NULL (this account has no OTP-verified identity yet), and the raw
+    phone number the player gave goes only onto PlayerProfile.phone as
+    editable, unverified profile information. Avatar assignment happens
+    after the account is safely committed (see the assign_new_avatar call
+    below) so a rare catalog-exhaustion failure there can never roll back
+    account creation itself — the same reasoning documented on
+    assign_new_avatar's own IntegrityError-retry loop."""
+    normalized_email = normalize_email(email)
+    normalized_phone = phone  # already normalized by PlayerSignupRequest's own validator
+    if session.scalar(select(User).where(func.lower(User.email) == normalized_email)):
+        raise api_error(409, "EMAIL_TAKEN", "An account with this email already exists.")
+
+    user = User(email=normalized_email, password_hash=PASSWORD_HASHER.hash(password), is_active=True)
+    session.add(user)
+    try:
+        session.flush()
+        session.add(PlayerProfile(user_id=user.id, display_name=name, phone=normalized_phone))
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        raise api_error(409, "EMAIL_TAKEN", "An account with this email already exists.")
+    session.refresh(user)
+    logger.info("player_account_created user_id=%s", user.id)
+
+    try:
+        assign_new_avatar(session, user.profile)
+    except HTTPException:
+        # Rare (a near-exhausted 256-design catalog): the account still
+        # exists without an avatar yet — the player can generate one from
+        # Edit Profile exactly as any existing avatar-less profile already
+        # can. Never worth losing the account creation over.
+        logger.warning("player_signup_avatar_assignment_failed user_id=%s", user.id)
+    return user
+
+
+def authenticate_player(session: Session, email: str, password: str) -> User | None:
+    """Verifies email+password credentials, always doing the same Argon2
+    work regardless of whether the email resolves to a real, password-having
+    account — see _DUMMY_PLAYER_PASSWORD_HASH above. Returns None (never
+    raises) on any failure: the caller (routers/player_auth.py) owns turning
+    that into the generic 401 and recording the rate-limit attempt, the same
+    split routers/auth.py's organizer login already uses."""
+    from argon2.exceptions import VerifyMismatchError
+
+    normalized_email = normalize_email(email)
+    user = session.scalar(select(User).where(func.lower(User.email) == normalized_email))
+    if user and user.is_active and user.password_hash:
+        try:
+            if PASSWORD_HASHER.verify(user.password_hash, password):
+                return user
+        except VerifyMismatchError:
+            pass
+        return None
+    try:
+        PASSWORD_HASHER.verify(_DUMMY_PLAYER_PASSWORD_HASH, password)
+    except VerifyMismatchError:
+        pass
+    return None
